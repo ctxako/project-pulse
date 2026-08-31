@@ -1,0 +1,40 @@
+# Project Pulse configuration.
+#
+# Copy to ~/.config/project-pulse/pulse.toml, or point $PULSE_CONFIG at it.
+# Every key is optional. A missing or malformed file is not an error: pulse
+# falls back to its defaults.
+
+# The workspace to scan. Overridden by --root and by $PROJECTS_ROOT.
+# Default: ~/Projects
+root = "~/Projects"
+
+# Directory inside the workspace holding unattended agent pipelines. Each
+# subdirectory containing logs/, state/, or orchestrator.py is picked up
+# automatically, and a launcher named after the directory becomes its START
+# command. Default: "AgentWorkflows"
+workflows_dir = "AgentWorkflows"
+
+# Arguments to append to a discovered workflow's START command, so the copied
+# command is runnable rather than a bare launcher name.
+[workflow_args]
+# uniwork = 'APP "issue"'
+
+# Pipelines that live outside workflows_dir. Each entry is skipped unless its
+# `detect` path exists, so one config can describe several machines.
+#
+# name          shown in the pipeline band
+# detect        file or directory that must exist; relative to root
+# start_command copied when the pipeline is selected
+# log           optional flat log; one run per line, each line starting with an
+#               ISO 8601 timestamp. Gives the band its run count and last line.
+
+# [[pipeline]]
+# name = "demo-capture"
+# detect = "demo-app/scripts/record-capture.sh"
+# start_command = "cd demo-app && make capture"
+# log = "~/Movies/Demo Ready to Post/runs.log"
+
+# [[pipeline]]
+# name = "agent-monitor"
+# detect = "Scripts/agent-monitor"
+# start_command = "Scripts/agent-monitor [repo]"

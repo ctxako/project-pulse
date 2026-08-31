@@ -1,0 +1,3610 @@
+#!/usr/bin/env python3
+"""Project Pulse: a read-only workspace dashboard and next-action picker."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import io
+import json
+import os
+import select
+import shutil
+import subprocess
+import sys
+import termios
+import time
+import tomllib
+import tty
+from contextlib import contextmanager, redirect_stdout
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+
+SKIP_DIRECTORIES = {
+    ".cache",
+    ".next",
+    ".venv",
+    "DerivedData",
+    "Pods",
+    "build",
+    "dist",
+    "node_modules",
+    "vendor",
+    "_archive",
+}
+MAIN_BRANCHES = {"main", "master", "develop", "development", "trunk"}
+VIBES = ("anything", "hygiene", "github", "terminal", "workflow", "organize", "build")
+
+# The ideas band is a different kind of suggestion from the runway above it:
+# nothing in local state can imply it, so a model writes it on request and it
+# stays until the user asks for another pass. Four kinds, so one refresh cannot
+# come back as four variations of the same thought.
+IDEA_KINDS = ("automation", "agent", "script", "tech")
+IDEA_LIMIT = 5
+IDEA_MODEL = "claude-fable-5"
+IDEA_TIMEOUT_SECONDS = 180
+IDEA_LEDGER_ENTRIES = 30
+IDEA_LEDGER_CHARACTERS = 40000  # backstop only; the budget is the entry count
+IDEA_README_LINES = 40
+
+# The live pane's cadence: local git is cheap enough to rescan every minute,
+# GitHub is slow enough to cache for five. A resolved item keeps its ✓ on
+# screen long enough to be seen, then leaves. A pane that has not stamped its
+# state within the marker TTL is presumed dead (crashed, or the machine slept).
+LIVE_REFRESH_SECONDS = 60
+GITHUB_REFRESH_SECONDS = 300
+RESOLVED_LINGER_SECONDS = 300
+LIVE_MARKER_TTL_SECONDS = 3 * LIVE_REFRESH_SECONDS
+COPY_BLINK_SECONDS = 0.12
+LIVE_RESIZE_POLL_SECONDS = 0.25
+DASHBOARD_MIN_WIDTH = 60
+DASHBOARD_MIN_HEIGHT = 20
+DASHBOARD_MAX_WIDTH = 132
+ALT_SCREEN_ENTER = "\033[?1049h"
+ALT_SCREEN_LEAVE = "\033[?1049l"
+CURSOR_HIDE = "\033[?25l"
+CURSOR_SHOW = "\033[?25h"
+
+# Five-pixel glyphs become three terminal rows through half-block rendering.
+# The outer letters sit one pixel lower than the middle, giving PULSE a subtle
+# arch without depending on a particular terminal font.
+WORDMARK_GLYPHS = {
+    "P": ("11110", "10001", "11110", "10000", "10000"),
+    "U": ("10001", "10001", "10001", "10001", "01110"),
+    "L": ("10000", "10000", "10000", "10000", "11111"),
+    "S": ("01111", "10000", "01110", "00001", "11110"),
+    "E": ("11111", "10000", "11110", "10000", "11111"),
+}
+WORDMARK_OFFSETS = (1, 0, 0, 0, 1)
+
+
+@dataclass
+class Repo:
+    name: str
+    path: str
+    branch: str = "unknown"
+    upstream: str | None = None
+    ahead: int = 0
+    behind: int = 0
+    staged: int = 0
+    unstaged: int = 0
+    untracked: int = 0
+    conflicted: int = 0
+    remote: str | None = None
+    local_only: bool = False
+    last_commit_at: str | None = None
+    age_days: int | None = None
+    has_readme: bool = False
+    has_workflow: bool = False
+    has_tests: bool = False
+    technology: str = "repo"
+
+    @property
+    def changed(self) -> int:
+        return self.staged + self.unstaged + self.untracked + self.conflicted
+
+    @property
+    def clean(self) -> bool:
+        return self.changed == 0
+
+
+@dataclass
+class Recommendation:
+    score: int
+    category: str
+    title: str
+    detail: str
+    command: str | None = None
+    repo: str | None = None
+    source: str = "local"
+    prompt: str | None = None  # ideas ship their own build-it prompt; git moves do not
+
+    @property
+    def id(self) -> str:
+        identity = "\x1f".join((self.category, self.repo or "", self.title, self.detail))
+        return hashlib.sha256(identity.encode()).hexdigest()[:12]
+
+
+@dataclass
+class Pipeline:
+    """Read-only snapshot of one unattended agent pipeline in the workflows directory."""
+
+    name: str
+    last_run_at: str | None = None
+    run_count: int = 0
+    last_line: str | None = None
+    queued: int = 0
+    review_files: int = 0
+    start_command: str | None = None
+
+
+@dataclass
+class GithubSnapshot:
+    available: bool
+    user: str | None = None
+    open_prs: list[dict[str, Any]] | None = None
+    review_requests: list[dict[str, Any]] | None = None
+    error: str | None = None
+
+
+def default_state_path() -> Path:
+    override = os.environ.get("PULSE_STATE_PATH")
+    if override:
+        return Path(override).expanduser()
+    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return state_home / "project-pulse" / "state.json"
+
+
+def read_state(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, ValueError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def write_state(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps({**state, "version": 1}, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def load_dismissals(path: Path) -> list[dict[str, Any]]:
+    dismissals = read_state(path).get("dismissed", [])
+    if not isinstance(dismissals, list):
+        return []
+    return [item for item in dismissals if isinstance(item, dict) and isinstance(item.get("id"), str)]
+
+
+def save_dismissals(path: Path, dismissals: list[dict[str, Any]]) -> None:
+    write_state(path, {**read_state(path), "dismissed": dismissals})
+
+
+LISTING_FIELDS = ("score", "category", "title", "detail", "command", "repo", "source")
+# Read with .get() so a state file written before the ideas band still parses.
+# A strict read would reject the whole listing and silently reset the numbering
+# a user is reading off an open pane.
+LISTING_OPTIONAL_FIELDS = ("prompt",)
+
+
+def save_listing(
+    path: Path, vibe: str, entries: list[tuple[int, Recommendation]], live_pid: int | None = None
+) -> None:
+    """Remember the list just shown, so `prompt N` means the N the user read.
+
+    Entries carry their displayed numbers explicitly: the live pane never reuses
+    a number within a session, so its list is sparse once items resolve.
+    """
+    listing = {
+        "shown_at": datetime.now(timezone.utc).isoformat(),
+        "vibe": vibe,
+        "items": [
+            {
+                "number": number,
+                **{field: getattr(item, field) for field in LISTING_FIELDS + LISTING_OPTIONAL_FIELDS},
+            }
+            for number, item in entries
+        ],
+    }
+    state = {**read_state(path), "listing": listing}
+    if live_pid is not None:
+        state["live"] = {"pid": live_pid, "updated_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        write_state(path, state)
+    except OSError:
+        pass  # A dashboard that cannot cache its numbering is still a useful dashboard.
+
+
+def load_listing(path: Path) -> tuple[list[tuple[int, Recommendation]], str | None]:
+    listing = read_state(path).get("listing")
+    if not isinstance(listing, dict) or not isinstance(listing.get("items"), list):
+        return [], None
+    entries: list[tuple[int, Recommendation]] = []
+    for index, entry in enumerate(listing["items"], 1):
+        if not isinstance(entry, dict):
+            return [], None
+        try:
+            values = {field: entry[field] for field in LISTING_FIELDS}
+            values.update({field: entry.get(field) for field in LISTING_OPTIONAL_FIELDS})
+            item = Recommendation(**values)
+        except (KeyError, TypeError):
+            return [], None
+        number = entry.get("number", index)  # pre-live state files had implicit 1..N numbering
+        if not isinstance(number, int):
+            return [], None
+        entries.append((number, item))
+    shown_at = listing.get("shown_at")
+    return entries, shown_at if isinstance(shown_at, str) else None
+
+
+def clear_live_marker(path: Path) -> None:
+    state = read_state(path)
+    if "live" in state:
+        try:
+            write_state(path, {key: value for key, value in state.items() if key != "live"})
+        except OSError:
+            pass
+
+
+def process_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # e.g. PermissionError: it exists, it just is not ours
+    return True
+
+
+def live_pane_owns_numbering(path: Path) -> bool:
+    """True while another process's live pane is the list the user is reading.
+
+    A one-shot run must not overwrite that pane's numbering: the pane is what
+    the user reads numbers off, so `prompt 3` has to keep meaning the pane's 3.
+    """
+    live = read_state(path).get("live")
+    if not isinstance(live, dict):
+        return False
+    pid = live.get("pid")
+    if not isinstance(pid, int) or pid == os.getpid():
+        return False
+    try:
+        stamped = datetime.fromisoformat(live.get("updated_at"))
+    except (TypeError, ValueError):
+        return False
+    age = (datetime.now(timezone.utc) - stamped).total_seconds()
+    return age < LIVE_MARKER_TTL_SECONDS and process_is_alive(pid)
+
+
+def dismiss_item(path: Path, dismissals: list[dict[str, Any]], item: Recommendation) -> list[dict[str, Any]]:
+    if any(entry["id"] == item.id for entry in dismissals):
+        return dismissals
+    updated = [
+        *dismissals,
+        {
+            "id": item.id,
+            "title": item.title,
+            "category": item.category,
+            "repo": item.repo,
+            "dismissed_at": datetime.now(timezone.utc).isoformat(),
+        },
+    ]
+    save_dismissals(path, updated)
+    return updated
+
+
+def visible_recommendations(
+    recommendations: list[Recommendation], dismissals: list[dict[str, Any]]
+) -> list[Recommendation]:
+    hidden = {item["id"] for item in dismissals}
+    return [item for item in recommendations if item.id not in hidden]
+
+
+def run(
+    command: list[str], cwd: Path | None = None, timeout: int = 8, stdin: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.update({"GH_PAGER": "cat", "PAGER": "cat", "CLICOLOR": "0"})
+    try:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            text=True,
+            input=stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(command, 124, "", str(exc))
+
+
+def git(repo: Path, *args: str) -> str | None:
+    result = run(["git", *args], cwd=repo)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def relative_name(root: Path, repo: Path) -> str:
+    relative = repo.relative_to(root)
+    return repo.name if str(relative) == "." else str(relative)
+
+
+def discover_repositories(root: Path) -> list[Path]:
+    repositories: list[Path] = []
+    for current, directories, _files in os.walk(root):
+        directories[:] = [
+            name
+            for name in directories
+            if name not in SKIP_DIRECTORIES and not (name.startswith(".") and name != ".git")
+        ]
+        path = Path(current)
+        if ".git" in directories or (path / ".git").is_file():
+            repositories.append(path)
+            # The workspace root being a repo (the meta-repo) must not stop the
+            # scan: the product repos live inside it. Nested repos stay opaque.
+            if path != root:
+                directories[:] = []
+    return sorted(repositories, key=lambda path: str(path).lower())
+
+
+def infer_technology(path: Path) -> str:
+    if (path / "Package.swift").exists() or list(path.glob("*.xcodeproj")):
+        return "swift"
+    if (path / "package.json").exists():
+        return "node"
+    if (path / "pyproject.toml").exists() or (path / "requirements.txt").exists():
+        return "python"
+    if (path / "Cargo.toml").exists():
+        return "rust"
+    if (path / "go.mod").exists():
+        return "go"
+    return "repo"
+
+
+def detects_tests(path: Path, technology: str) -> bool:
+    if (path / "tests").is_dir() or (path / "Tests").is_dir():
+        return True
+    if technology == "node":
+        try:
+            package = json.loads((path / "package.json").read_text())
+            scripts = package.get("scripts", {})
+            return any(name in scripts for name in ("test", "check", "lint", "typecheck"))
+        except (OSError, ValueError, TypeError):
+            return False
+    if technology == "swift":
+        return bool(list(path.glob("*Tests"))) or (path / "Tests").exists()
+    makefile = path / "Makefile"
+    if makefile.exists():
+        try:
+            return "test:" in makefile.read_text(errors="ignore")
+        except OSError:
+            pass
+    return False
+
+
+def declares_local_only(path: Path) -> bool:
+    """True when the repo has declared, in its own config, that it stays off GitHub.
+
+    Without a durable declaration the "no origin remote" card is unanswerable: a
+    deliberate local-only repo looks identical to one nobody got around to
+    publishing, so the card returns every scan. `git config --bool pulse.localOnly
+    true` records the decision where the repo itself keeps it.
+    """
+    value = git(path, "config", "--bool", "--get", "pulse.localOnly")
+    return value == "true"
+
+
+def inspect_repo(root: Path, path: Path, now: datetime) -> Repo:
+    status = git(path, "status", "--porcelain=v2", "--branch", "--untracked-files=normal") or ""
+    repo = Repo(name=relative_name(root, path), path=str(path))
+    for line in status.splitlines():
+        if line.startswith("# branch.head "):
+            repo.branch = line.removeprefix("# branch.head ")
+        elif line.startswith("# branch.upstream "):
+            repo.upstream = line.removeprefix("# branch.upstream ")
+        elif line.startswith("# branch.ab "):
+            pieces = line.split()
+            repo.ahead = int(pieces[2].lstrip("+"))
+            repo.behind = abs(int(pieces[3]))
+        elif line.startswith("? "):
+            repo.untracked += 1
+        elif line.startswith("u "):
+            repo.conflicted += 1
+        elif line.startswith(("1 ", "2 ")):
+            state = line.split(maxsplit=2)[1]
+            if state[0] != ".":
+                repo.staged += 1
+            if state[1] != ".":
+                repo.unstaged += 1
+
+    repo.remote = git(path, "remote", "get-url", "origin")
+    repo.local_only = declares_local_only(path)
+    epoch = git(path, "log", "-1", "--format=%ct")
+    if epoch and epoch.isdigit():
+        committed = datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+        repo.last_commit_at = committed.isoformat()
+        repo.age_days = max(0, (now - committed).days)
+
+    repo.has_readme = any((path / name).exists() for name in ("README.md", "README", "README.rst"))
+    workflow_dir = path / ".github" / "workflows"
+    repo.has_workflow = workflow_dir.is_dir() and any(
+        item.suffix in {".yml", ".yaml"} for item in workflow_dir.iterdir() if item.is_file()
+    )
+    repo.technology = infer_technology(path)
+    repo.has_tests = detects_tests(path, repo.technology)
+    return repo
+
+
+def inspect_workspace(root: Path) -> list[Repo]:
+    now = datetime.now(timezone.utc)
+    return [inspect_repo(root, path, now) for path in discover_repositories(root)]
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+#
+# Pulse ships knowing nothing about your workspace beyond "it is a directory of
+# repositories". Anything site-specific — where the root is, what the workflows
+# directory is called, and any pipeline that lives outside it — comes from a
+# TOML file. See pulse.toml.example. A missing or malformed file is not an
+# error: pulse falls back to its defaults and `pulse doctor` reports why.
+# ---------------------------------------------------------------------------
+
+CONFIG_ENV = "PULSE_CONFIG"
+DEFAULT_WORKFLOWS_DIR = "AgentWorkflows"
+
+
+def config_path() -> Path:
+    override = os.environ.get(CONFIG_ENV)
+    if override:
+        return Path(override).expanduser()
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return config_home / "project-pulse" / "pulse.toml"
+
+
+def load_config(path: Path | None = None) -> dict[str, Any]:
+    """Read the TOML config. Any failure yields {} so pulse still runs."""
+    target = path or config_path()
+    try:
+        with target.open("rb") as handle:
+            loaded = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def configured_root(config: dict[str, Any]) -> Path | None:
+    root = config.get("root")
+    return Path(str(root)).expanduser() if isinstance(root, str) and root else None
+
+
+def configured_pipelines(root: Path, config: dict[str, Any]) -> list[Pipeline]:
+    """Build pipelines declared in [[pipeline]] that live outside the workflows directory.
+
+    Each entry is skipped unless its `detect` path exists, so a config shared
+    across machines quietly describes only what is actually installed here.
+    """
+    entries = config.get("pipeline")
+    if not isinstance(entries, list):
+        return []
+    pipelines: list[Pipeline] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        detect = entry.get("detect")
+        if not isinstance(name, str) or not name or not isinstance(detect, str) or not detect:
+            continue
+        marker = Path(detect).expanduser()
+        if not marker.is_absolute():
+            marker = root / marker
+        if not marker.exists():
+            continue
+        pipeline = Pipeline(name=name)
+        start = entry.get("start_command")
+        if isinstance(start, str) and start:
+            pipeline.start_command = start
+        log = entry.get("log")
+        if isinstance(log, str) and log:
+            log_path = Path(log).expanduser()
+            if not log_path.is_absolute():
+                log_path = root / log_path
+            read_pipeline_log(pipeline, log_path)
+        pipelines.append(pipeline)
+    return pipelines
+
+
+def read_pipeline_log(pipeline: Pipeline, log_path: Path) -> None:
+    """Count runs in a flat log whose every line begins with an ISO timestamp."""
+    try:
+        lines = [
+            line.strip()
+            for line in log_path.read_text(errors="replace").splitlines()
+            if line.strip()
+        ]
+        pipeline.run_count = len(lines)
+        if lines:
+            stamp = lines[-1].split(maxsplit=1)[0]
+            pipeline.last_run_at = datetime.fromisoformat(stamp).astimezone().isoformat()
+            pipeline.last_line = lines[-1][:120]
+    except (OSError, ValueError):
+        pass
+
+
+def inspect_pipelines(root: Path, config: dict[str, Any] | None = None) -> list[Pipeline]:
+    """Summarize the workspace's workflows from their logs and state. Read-only."""
+    config = load_config() if config is None else config
+    workflows_name = config.get("workflows_dir")
+    if not isinstance(workflows_name, str) or not workflows_name:
+        workflows_name = DEFAULT_WORKFLOWS_DIR
+    workflow_args = config.get("workflow_args")
+    if not isinstance(workflow_args, dict):
+        workflow_args = {}
+    workflows = root / workflows_name
+    pipelines: list[Pipeline] = []
+    if workflows.is_dir():
+        for directory in sorted(workflows.iterdir()):
+            if not directory.is_dir() or directory.name.startswith((".", "_")):
+                continue
+            if not any((directory / marker).exists() for marker in ("logs", "state", "orchestrator.py")):
+                continue
+            pipeline = Pipeline(name=directory.name)
+            launcher = directory / directory.name
+            if launcher.is_file():
+                relative_launcher = launcher.relative_to(root)
+                pipeline.start_command = str(relative_launcher)
+                suffix = workflow_args.get(directory.name)
+                if isinstance(suffix, str) and suffix:
+                    pipeline.start_command += f" {suffix}"
+            try:
+                run_logs = sorted(directory.glob("logs/run-*.log"), key=lambda path: path.stat().st_mtime)
+                pipeline.run_count = len(run_logs)
+                if run_logs:
+                    newest = run_logs[-1]
+                    finished = datetime.fromtimestamp(newest.stat().st_mtime).astimezone()
+                    pipeline.last_run_at = finished.isoformat()
+                    lines = [line.strip() for line in newest.read_text(errors="replace").splitlines() if line.strip()]
+                    if lines:
+                        pipeline.last_line = lines[-1][:120]
+                queue = directory / "state" / "queue"
+                if queue.is_dir():
+                    pipeline.queued = sum(1 for item in queue.iterdir() if not item.name.startswith("."))
+                reviews = directory / "state" / "reviews"
+                if reviews.is_dir():
+                    pipeline.review_files = sum(
+                        1 for item in reviews.rglob("*") if item.is_file() and not item.name.startswith(".")
+                    )
+            except OSError:
+                pass
+            pipelines.append(pipeline)
+
+    pipelines.extend(configured_pipelines(root, config))
+    return pipelines
+
+
+# ---------------------------------------------------------------------------
+# Live agent sessions
+#
+# `pulse agents` shows the interactive Claude Code and Codex sessions working
+# in the workspace right now, as a band of six positions. Everything here is read-only
+# and fails closed: a missing provider directory, a dead PID, a truncated
+# trail, or a record whose shape drifted yields nothing rather than a crash.
+# Nothing is shared with any external monitor, which keeps its own snapshot;
+# this reads the providers' own files directly.
+# ---------------------------------------------------------------------------
+
+AGENT_STATES = ("still", "thinking", "editing", "finishing", "waiting")
+AGENT_TICK_SECONDS = 1.0
+AGENT_CURSOR_TTL_SECONDS = 600
+CLAUDE_INVENTORY_REFRESH_SECONDS = 5.0
+CLAUDE_INVENTORY_TIMEOUT_SECONDS = 3
+CLAUDE_EDIT_TOOLS = frozenset({"Edit", "Write"})
+CLAUDE_QUESTION_TOOL = "AskUserQuestion"
+CLAUDE_SUBAGENT_TOOL = "Agent"
+CODEX_EDIT_TOOLS = frozenset({"apply_patch"})
+CODEX_QUESTION_TOOL = "request_user_input"
+CODEX_APPROVAL_EVENTS = frozenset({"exec_approval_request", "apply_patch_approval_request"})
+CODEX_APPROVAL_DECISIONS = frozenset(
+    {"exec_command_begin", "patch_apply_begin", "exec_command_end", "patch_apply_end"}
+)
+
+
+@dataclass
+class AgentEvent:
+    """One thing a session did, reduced to what the band may show.
+
+    `label` is a tool name or a file basename — never a prompt, an argument,
+    an answer, or a full path. `key` pairs a question with its answer and a
+    subagent's start with its end.
+    """
+
+    at: datetime
+    kind: str  # activity | edit | question | answer | turn_end | subagent_start | subagent_end
+    label: str = ""
+    key: str | None = None
+
+
+@dataclass
+class AgentObservation:
+    """One provider session as seen on this scan, with the events appended since the last."""
+
+    provider: str  # claude | codex
+    session_id: str
+    project: str
+    started_at: datetime
+    trail: Path | None = None
+    parent_id: str | None = None  # a Codex child thread; never gets a strip of its own
+    status: str | None = None  # the provider's own word for it, if it has one
+    events: list[AgentEvent] = field(default_factory=list)
+
+    @property
+    def key(self) -> str:
+        return f"{self.provider}:{self.session_id}"
+
+
+class TrailCursor:
+    """Byte offset into one JSONL trail; only complete appended lines are parsed."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.offset = 0
+        self.last_seen = 0.0
+
+    def read_new_records(self) -> list[dict[str, Any]]:
+        try:
+            size = self.path.stat().st_size
+            if size < self.offset:
+                self.offset = 0  # rewritten or truncated: start over rather than mid-record
+            if size == self.offset:
+                return []
+            with self.path.open("rb") as handle:
+                handle.seek(self.offset)
+                chunk = handle.read(size - self.offset)
+        except OSError:
+            return []
+        complete = chunk.rfind(b"\n")
+        if complete < 0:
+            return []  # a record still being written; wait for its newline
+        self.offset += complete + 1
+        records: list[dict[str, Any]] = []
+        for line in chunk[:complete].split(b"\n"):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+        return records
+
+
+def parse_agent_timestamp(value: Any, fallback: datetime) -> datetime:
+    if isinstance(value, (int, float)):
+        seconds = value / 1000 if value > 1e11 else value  # epoch millis vs seconds
+        try:
+            return datetime.fromtimestamp(seconds, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return fallback
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return fallback
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return fallback
+
+
+def agent_project_name(cwd: Any, root: Path) -> str:
+    """The workspace folder a session works in, never the full path."""
+    if not isinstance(cwd, str) or not cwd:
+        return "?"
+    path = Path(cwd)
+    try:
+        relative = path.resolve().relative_to(root.resolve())
+    except (OSError, ValueError, RuntimeError):
+        return path.name or "?"
+    if not relative.parts:
+        return root.name or "?"
+    return relative.parts[0]
+
+
+def sanitized_basename(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    return Path(value).name
+
+
+def claude_events(record: dict[str, Any], now: datetime) -> list[AgentEvent]:
+    """Normalize one Claude Code trail record. Unknown shapes yield nothing."""
+    if record.get("isSidechain"):
+        return []  # a subagent's own turns, folded into the parent by its Agent call
+    at = parse_agent_timestamp(record.get("timestamp"), now)
+    kind = record.get("type")
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    events: list[AgentEvent] = []
+    if kind == "assistant":
+        blocks = content if isinstance(content, list) else []
+        for block in blocks:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = block.get("name")
+            call_id = block.get("id") if isinstance(block.get("id"), str) else None
+            arguments = block.get("input") if isinstance(block.get("input"), dict) else {}
+            if not isinstance(name, str):
+                continue
+            if name in CLAUDE_EDIT_TOOLS:
+                events.append(AgentEvent(at, "edit", sanitized_basename(arguments.get("file_path")) or name))
+            elif name == CLAUDE_QUESTION_TOOL:
+                events.append(AgentEvent(at, "question", name, call_id))
+            elif name == CLAUDE_SUBAGENT_TOOL:
+                events.append(AgentEvent(at, "subagent_start", name, call_id))
+            else:
+                events.append(AgentEvent(at, "activity", name))
+        if not events:
+            if message.get("stop_reason") == "end_turn" if isinstance(message, dict) else False:
+                events.append(AgentEvent(at, "turn_end"))
+            else:
+                events.append(AgentEvent(at, "activity", "reasoning"))
+    elif kind == "user":
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    key = block.get("tool_use_id")
+                    events.append(AgentEvent(at, "answer", "", key if isinstance(key, str) else None))
+            if not events:
+                events.append(AgentEvent(at, "activity", "prompt"))
+        elif isinstance(content, str):
+            events.append(AgentEvent(at, "activity", "prompt"))
+    elif kind == "system" and record.get("subtype") == "turn_duration":
+        events.append(AgentEvent(at, "turn_end"))
+    return events
+
+
+def codex_events(record: dict[str, Any], now: datetime) -> list[AgentEvent]:
+    """Normalize one Codex rollout record. Unknown shapes yield nothing."""
+    at = parse_agent_timestamp(record.get("timestamp"), now)
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return []
+    kind = record.get("type")
+    item_type = payload.get("type")
+    if kind == "response_item":
+        if item_type in ("function_call", "custom_tool_call"):
+            name = payload.get("name")
+            call_id = payload.get("call_id") if isinstance(payload.get("call_id"), str) else None
+            if not isinstance(name, str):
+                return []
+            if name == CODEX_QUESTION_TOOL:
+                return [AgentEvent(at, "question", name, call_id)]
+            if name in CODEX_EDIT_TOOLS:
+                return [AgentEvent(at, "edit", name)]
+            return [AgentEvent(at, "activity", name)]
+        if item_type in ("function_call_output", "custom_tool_call_output"):
+            call_id = payload.get("call_id")
+            return [AgentEvent(at, "answer", "", call_id if isinstance(call_id, str) else None)]
+        if item_type == "reasoning":
+            return [AgentEvent(at, "activity", "reasoning")]
+        if item_type == "message":
+            role = payload.get("role")
+            if role == "assistant":
+                return [AgentEvent(at, "activity", "message")]
+            if role == "user":
+                return [AgentEvent(at, "activity", "prompt")]
+        return []
+    if kind == "event_msg":
+        if item_type in ("task_complete", "turn_aborted"):
+            return [AgentEvent(at, "turn_end")]
+        if item_type == "task_started":
+            return [AgentEvent(at, "activity", "turn")]
+        if item_type in CODEX_APPROVAL_EVENTS:
+            call_id = payload.get("call_id")
+            return [AgentEvent(at, "question", item_type, call_id if isinstance(call_id, str) else None)]
+        if item_type in CODEX_APPROVAL_DECISIONS:
+            call_id = payload.get("call_id")
+            events = [AgentEvent(at, "answer", "", call_id if isinstance(call_id, str) else None)]
+            if item_type == "patch_apply_end":
+                events.append(AgentEvent(at, "edit", "patch"))
+            return events
+        if item_type == "item_completed":
+            item = payload.get("item")
+            if not isinstance(item, dict):
+                return []
+            item_kind = item.get("type")
+            if item_kind == "FileChange":
+                changes = item.get("changes")
+                first = next(iter(changes), "") if isinstance(changes, dict) else ""
+                return [AgentEvent(at, "edit", sanitized_basename(first) or "patch")]
+            if item_kind == "CommandExecution":
+                return [AgentEvent(at, "activity", "command")]
+            if item_kind in ("Reasoning", "AgentMessage", "Plan"):
+                return [AgentEvent(at, "activity", item_kind.lower())]
+            if item_kind == "UserMessage":
+                return [AgentEvent(at, "activity", "prompt")]
+            return []
+        if item_type == "agent_reasoning":
+            return [AgentEvent(at, "activity", "reasoning")]
+        if item_type == "user_message":
+            return [AgentEvent(at, "activity", "prompt")]
+        if item_type == "agent_message":
+            return [AgentEvent(at, "activity", "message")]
+    return []
+
+
+def claude_trail_path(home: Path, session_id: str) -> Path | None:
+    """The project slug mangles `/`, `.`, and `_` alike, so match by session ID instead."""
+    projects = home / ".claude" / "projects"
+    try:
+        matches = [path for path in projects.glob(f"*/{session_id}.jsonl") if path.is_file()]
+    except OSError:
+        return None
+    if not matches:
+        return None
+    return max(matches, key=lambda path: path.stat().st_mtime)
+
+
+def read_claude_inventory() -> list[dict[str, Any]] | None:
+    """Ask Claude Code which sessions exist, rather than trusting its stale registry.
+
+    `~/.claude/sessions` is useful implementation detail but is not lifecycle
+    authority: a record can remain after the terminal closes, and a recycled PID
+    can make that old record look live again. `claude agents --json` answers the
+    one question this pane needs for admission: which sessions are running now.
+    None means the command itself was unavailable or unreadable; callers fail
+    closed instead of reviving a registry entry from an earlier session.
+    """
+    result = run(["claude", "agents", "--json"], timeout=CLAUDE_INVENTORY_TIMEOUT_SECONDS)
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout or "[]")
+    except ValueError:
+        return None
+    if not isinstance(payload, list):
+        return None
+    return [entry for entry in payload if isinstance(entry, dict)]
+
+
+def claude_live_sessions(
+    home: Path, root: Path, now: datetime, inventory: Iterable[dict[str, Any]]
+) -> list[AgentObservation]:
+    """Turn Claude's current inventory into band observations.
+
+    Trails remain local and are only used for activity detail. Their presence,
+    as well as the legacy on-disk session registry, never makes a card live.
+    """
+    observations: list[AgentObservation] = []
+    seen: set[str] = set()
+    for record in inventory:
+        session_id = record.get("sessionId")
+        if not isinstance(session_id, str) or not session_id or session_id in seen:
+            continue
+        seen.add(session_id)
+        status = record.get("status")
+        observations.append(
+            AgentObservation(
+                provider="claude",
+                session_id=session_id,
+                project=agent_project_name(record.get("cwd"), root),
+                started_at=parse_agent_timestamp(record.get("startedAt"), now),
+                trail=claude_trail_path(home, session_id),
+                status=status if isinstance(status, str) else None,
+            )
+        )
+    return observations
+
+
+def codex_session_index(home: Path) -> dict[str, dict[str, Any]]:
+    """The newest index entry per thread; the index appends a line per rename."""
+    index: dict[str, dict[str, Any]] = {}
+    path = home / ".codex" / "session_index.jsonl"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return index
+    for line in text.splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+            index[entry["id"]] = entry
+    return index
+
+
+def codex_rollout_path(home: Path, session_id: str) -> Path | None:
+    sessions = home / ".codex" / "sessions"
+    try:
+        matches = [path for path in sessions.glob(f"*/*/*/rollout-*-{session_id}.jsonl") if path.is_file()]
+    except OSError:
+        return None
+    if not matches:
+        return None
+    return max(matches, key=lambda path: path.stat().st_mtime)
+
+
+def codex_session_meta(path: Path) -> dict[str, Any] | None:
+    """The first rollout line; read alone because it carries the full base instructions."""
+    try:
+        with path.open("rb") as handle:
+            first = handle.readline()
+        record = json.loads(first)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return None
+    payload = record.get("payload")
+    return payload if isinstance(payload, dict) else None
+
+
+def codex_lock_held(lock: Path) -> bool:
+    """Whether some process holds the advisory lock on a Codex thread-writer lock file.
+
+    The file is empty; the lock lives in the kernel and is released the moment
+    the holder exits, so a shared non-blocking probe distinguishes a running
+    thread from a lock left behind. Verified both ways against codex-cli
+    0.151.0: held from the thread's first tenth of a second, deleted on a
+    clean exit, left on disk and unheld when the terminal is closed on it.
+    Any error other than contention counts as held, so an odd filesystem
+    shows a session rather than hiding one.
+    """
+    try:
+        descriptor = os.open(lock, os.O_RDONLY)
+    except OSError:
+        return True
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        return True  # contention means a live holder; anything else is not proof of absence
+    else:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def codex_live_sessions(home: Path, root: Path, now: datetime) -> list[AgentObservation]:
+    locks = home / ".codex" / "thread-writer-locks"
+    observations: list[AgentObservation] = []
+    try:
+        lock_files = sorted(locks.glob("*.lock"))
+    except OSError:
+        return observations
+    index = codex_session_index(home) if lock_files else {}
+    for lock in lock_files:
+        if lock.name.startswith("."):
+            continue  # .coordination.lock guards the directory, not a thread
+        session_id = lock.stem
+        trail = codex_rollout_path(home, session_id)
+        if trail is None or not codex_lock_held(lock):
+            continue  # a lock nobody holds is one a killed thread left behind
+        meta = codex_session_meta(trail)
+        if meta is None:
+            continue
+        parent = meta.get("parent_thread_id")
+        indexed = index.get(session_id, {})
+        started = parse_agent_timestamp(meta.get("timestamp"), parse_agent_timestamp(indexed.get("updated_at"), now))
+        observations.append(
+            AgentObservation(
+                provider="codex",
+                session_id=session_id,
+                project=agent_project_name(meta.get("cwd"), root),
+                started_at=started,
+                trail=trail,
+                parent_id=parent if isinstance(parent, str) and parent else None,
+            )
+        )
+    return observations
+
+
+class AgentCollector:
+    """Enumerates live sessions each tick and drains their trails incrementally.
+
+    Cursors outlive a scan that misses their session — a lock or registry
+    file can vanish for a moment — so a returning session picks up where it
+    left off instead of replaying its whole trail.
+    """
+
+    def __init__(self, home: Path | None = None, root: Path | None = None):
+        self.home = home or Path.home()
+        self.root = root or self.home / "Projects"
+        self.cursors: dict[str, TrailCursor] = {}
+        self.claude_inventory: list[dict[str, Any]] | None = None
+        self.claude_inventory_at: float | None = None
+
+    def claude_sessions(self, now: datetime) -> list[AgentObservation]:
+        """Refresh the independent Claude inventory at a bounded cadence.
+
+        The pane redraws every second, but starting a CLI process every second
+        would be disproportionate. Five seconds is short enough for a closed
+        card to disperse promptly and keeps the provider query off the hot path.
+        """
+        clock = time.monotonic()
+        if (
+            self.claude_inventory_at is None
+            or clock - self.claude_inventory_at >= CLAUDE_INVENTORY_REFRESH_SECONDS
+        ):
+            self.claude_inventory = read_claude_inventory()
+            self.claude_inventory_at = clock
+        return claude_live_sessions(self.home, self.root, now, self.claude_inventory or [])
+
+    def scan(self, now: datetime | None = None) -> list[AgentObservation]:
+        now = now or datetime.now(timezone.utc)
+        observations: list[AgentObservation] = []
+        try:
+            observations.extend(self.claude_sessions(now))
+        except Exception:  # noqa: BLE001 - the band must never take the dashboard down
+            pass
+        try:
+            observations.extend(codex_live_sessions(self.home, self.root, now))
+        except Exception:  # noqa: BLE001 - the band must never take the dashboard down
+            pass
+        clock = time.monotonic()
+        for observation in observations:
+            if observation.trail is None:
+                continue
+            cursor = self.cursors.get(observation.key)
+            if cursor is None or cursor.path != observation.trail:
+                cursor = self.cursors[observation.key] = TrailCursor(observation.trail)
+            cursor.last_seen = clock
+            normalize = claude_events if observation.provider == "claude" else codex_events
+            for record in cursor.read_new_records():
+                try:
+                    observation.events.extend(normalize(record, now))
+                except Exception:  # noqa: BLE001 - one odd record is not a reason to stop
+                    continue
+        for key in [key for key, cursor in self.cursors.items() if clock - cursor.last_seen > AGENT_CURSOR_TTL_SECONDS]:
+            del self.cursors[key]
+        return observations
+
+
+AGENT_FINISHING_SECONDS = 120
+AGENT_FADE_SECONDS = 5
+AGENT_BAND_POSITIONS = 6  # the stable first row; the renderer can reveal queued rows
+
+
+@dataclass
+class AgentSession:
+    """A top-level session as the band shows it."""
+
+    provider: str
+    session_id: str
+    project: str
+    started_at: datetime
+    state: str = "still"
+    state_since: datetime | None = None
+    activity: str = ""
+    subagents: int = 0
+
+    @property
+    def key(self) -> str:
+        return f"{self.provider}:{self.session_id}"
+
+
+class AgentLedger:
+    """Reduces one session's events into a state, with strict waiting precedence.
+
+    Waiting is only ever an unmatched question — a user prompt the agent put up
+    and has not had answered. While one is open, nothing else the trail says
+    can move the state; the answer (matched by key) releases it. Silence is
+    never waiting. Finishing owns the state for exactly
+    AGENT_FINISHING_SECONDS, then falls back to still.
+    """
+
+    def __init__(self, started_at: datetime):
+        self.state = "still"
+        self.state_since = started_at
+        self.activity = ""
+        self.open_questions: set[str] = set()
+        self.unkeyed_questions = 0
+        self.open_subagents: set[str] = set()
+
+    @property
+    def waiting(self) -> bool:
+        return bool(self.open_questions) or self.unkeyed_questions > 0
+
+    def move(self, state: str, at: datetime, activity: str | None = None) -> None:
+        if state not in AGENT_STATES:
+            state = "still"
+        if state != self.state:
+            self.state = state
+            self.state_since = at
+        if activity is not None:
+            self.activity = activity
+
+    def apply(self, event: AgentEvent) -> None:
+        at = event.at
+        if event.kind == "question":
+            if event.key:
+                self.open_questions.add(event.key)
+            else:
+                self.unkeyed_questions += 1
+            self.move("waiting", at, event.label or "question")
+            return
+        if event.kind == "answer":
+            released = False
+            if event.key and event.key in self.open_questions:
+                self.open_questions.discard(event.key)
+                released = True
+            elif event.key and event.key in self.open_subagents:
+                self.open_subagents.discard(event.key)
+            elif self.unkeyed_questions:
+                self.unkeyed_questions -= 1
+                released = True
+            if self.waiting:
+                return
+            if released:
+                self.move("thinking", at, "answered")
+            elif self.state == "waiting":
+                self.move("thinking", at)
+            else:
+                self.move("thinking", at, self.activity)
+            return
+        if self.waiting:
+            return  # an open question outranks anything else the trail says
+        if event.kind == "subagent_start":
+            if event.key:
+                self.open_subagents.add(event.key)
+            self.move("thinking", at, event.label or "Agent")
+        elif event.kind == "subagent_end":
+            if event.key:
+                self.open_subagents.discard(event.key)
+        elif event.kind == "edit":
+            self.move("editing", at, event.label)
+        elif event.kind == "turn_end":
+            self.move("finishing", at, "turn done")
+        elif event.kind == "activity":
+            self.move("thinking", at, event.label)
+
+    def settle(self, now: datetime) -> None:
+        """Finishing is a timed celebration; time it out even without new events."""
+        if self.state == "finishing" and (now - self.state_since).total_seconds() >= AGENT_FINISHING_SECONDS:
+            self.state = "still"
+            self.state_since = self.state_since + timedelta(seconds=AGENT_FINISHING_SECONDS)
+            self.activity = ""
+
+
+@dataclass
+class AgentStrip:
+    session: AgentSession
+    closed_at: datetime | None = None  # the fade began; the position frees AGENT_FADE_SECONDS later
+
+    @property
+    def fading(self) -> bool:
+        return self.closed_at is not None
+
+
+class AgentBand:
+    """Six stable positions, admitted FIFO by start time, never rearranged.
+
+    An occupant keeps its position until it has been gone for the fade. A
+    still-live session can keep its finishing celebration, but provider
+    absence always begins the fade. Overflow queues FIFO; the header says how
+    many, and the oldest queued session that is still live takes the exact
+    position that opens.
+    """
+
+    def __init__(self, positions: int = AGENT_BAND_POSITIONS):
+        self.positions: list[AgentStrip | None] = [None] * positions
+        self.queue: list[str] = []
+        self.ledgers: dict[str, AgentLedger] = {}
+        self.sessions: dict[str, AgentSession] = {}
+
+    @property
+    def active(self) -> bool:
+        return any(self.positions)
+
+    @property
+    def queued(self) -> int:
+        return len(self.queue)
+
+    def placed(self) -> set[str]:
+        return {strip.session.key for strip in self.positions if strip}
+
+    def update(self, observations: list[AgentObservation], now: datetime) -> None:
+        children: dict[str, int] = {}
+        for observation in observations:
+            if observation.parent_id:
+                children[f"{observation.provider}:{observation.parent_id}"] = (
+                    children.get(f"{observation.provider}:{observation.parent_id}", 0) + 1
+                )
+        live: dict[str, AgentObservation] = {
+            observation.key: observation for observation in observations if not observation.parent_id
+        }
+        for key, observation in live.items():
+            ledger = self.ledgers.get(key)
+            if ledger is None:
+                ledger = self.ledgers[key] = AgentLedger(observation.started_at)
+            for event in observation.events:
+                ledger.apply(event)
+            ledger.settle(now)
+            session = self.sessions.get(key)
+            if session is None:
+                session = self.sessions[key] = AgentSession(
+                    observation.provider, observation.session_id, observation.project, observation.started_at
+                )
+            session.project = observation.project
+            session.state = ledger.state
+            session.state_since = ledger.state_since
+            session.activity = ledger.activity
+            session.subagents = len(ledger.open_subagents) + children.get(key, 0)
+
+        for index, strip in enumerate(self.positions):
+            if strip is None:
+                continue
+            key = strip.session.key
+            if key in live:
+                strip.closed_at = None
+                continue
+            ledger = self.ledgers.get(key)
+            if ledger is not None:
+                ledger.settle(now)
+                strip.session.state = ledger.state
+                strip.session.state_since = ledger.state_since
+                strip.session.activity = ledger.activity
+            if strip.closed_at is None:
+                strip.closed_at = now
+            elif (now - strip.closed_at).total_seconds() >= AGENT_FADE_SECONDS:
+                self.positions[index] = None
+                self.ledgers.pop(key, None)
+                self.sessions.pop(key, None)
+
+        self.queue = [key for key in self.queue if key in live]  # a queued session that closed is skipped
+        placed = self.placed()
+        arriving = sorted(
+            (key for key in live if key not in placed and key not in self.queue),
+            key=lambda key: (live[key].started_at, key),
+        )
+        self.queue.extend(arriving)
+        for index, strip in enumerate(self.positions):
+            if strip is None and self.queue:
+                self.positions[index] = AgentStrip(self.sessions[self.queue.pop(0)])
+        for key in [key for key in self.ledgers if key not in live and key not in self.placed()]:
+            self.ledgers.pop(key, None)
+            self.sessions.pop(key, None)
+
+
+def parse_gh_json(arguments: list[str]) -> tuple[list[dict[str, Any]], str | None]:
+    result = run(["gh", *arguments], timeout=15)
+    if result.returncode != 0:
+        return [], result.stderr.strip() or "GitHub command failed"
+    try:
+        payload = json.loads(result.stdout or "[]")
+        return payload if isinstance(payload, list) else [], None
+    except json.JSONDecodeError:
+        return [], "GitHub returned an unreadable response"
+
+
+def fetch_github(local_only: bool) -> GithubSnapshot:
+    if local_only:
+        return GithubSnapshot(available=False, error="Skipped with --local")
+    if not shutil.which("gh"):
+        return GithubSnapshot(available=False, error="GitHub CLI is not installed")
+
+    auth = run(["gh", "auth", "status", "--hostname", "github.com"])
+    if auth.returncode != 0:
+        return GithubSnapshot(
+            available=False,
+            error="GitHub CLI needs authentication: gh auth login -h github.com",
+        )
+
+    user_result = run(["gh", "api", "user", "--jq", ".login"])
+    if user_result.returncode != 0:
+        return GithubSnapshot(available=False, error="GitHub is authenticated but the API is unreachable")
+    user = user_result.stdout.strip()
+
+    fields = "number,title,repository,url,updatedAt,isDraft"
+    open_prs, pr_error = parse_gh_json(
+        ["search", "prs", "--author", "@me", "--state", "open", "--limit", "50", "--json", fields]
+    )
+    reviews, review_error = parse_gh_json(
+        ["search", "prs", "--review-requested", "@me", "--state", "open", "--limit", "50", "--json", fields]
+    )
+    error = pr_error or review_error
+    return GithubSnapshot(
+        available=error is None,
+        user=user,
+        open_prs=open_prs,
+        review_requests=reviews,
+        error=error,
+    )
+
+
+def shell_path(path: str) -> str:
+    return "'" + path.replace("'", "'\\''") + "'"
+
+
+def repo_recommendations(repo: Repo, starter_exists: bool = True) -> list[Recommendation]:
+    recommendations: list[Recommendation] = []
+    cd = f"cd {shell_path(repo.path)}"
+
+    if repo.conflicted:
+        recommendations.append(Recommendation(
+            120, "hygiene", f"Resolve the interrupted Git operation in {repo.name}",
+            f"{repo.conflicted} conflicted path(s) are keeping this repository in limbo.",
+            f"{cd} && git status", repo.name,
+        ))
+    elif repo.changed:
+        pieces = []
+        if repo.staged:
+            pieces.append(f"{repo.staged} staged")
+        if repo.unstaged:
+            pieces.append(f"{repo.unstaged} modified")
+        if repo.untracked:
+            pieces.append(f"{repo.untracked} untracked")
+        recommendations.append(Recommendation(
+            94 + min(repo.changed, 15), "hygiene", f"Close the open loop in {repo.name}",
+            f"Review {', '.join(pieces)} path(s), then commit, split, stash, or discard them intentionally.",
+            f"{cd} && git status --short", repo.name,
+        ))
+
+    if repo.ahead:
+        recommendations.append(Recommendation(
+            96, "github", f"Publish {repo.name}'s local work",
+            f"{repo.branch} is {repo.ahead} commit(s) ahead of {repo.upstream}.",
+            f"{cd} && git push", repo.name,
+        ))
+    if repo.behind:
+        recommendations.append(Recommendation(
+            88, "github", f"Bring {repo.name} up to date",
+            f"{repo.branch} is {repo.behind} commit(s) behind {repo.upstream}.",
+            f"{cd} && git pull --ff-only", repo.name,
+        ))
+    if not repo.remote and not repo.local_only:
+        recommendations.append(Recommendation(
+            82, "github", f"Decide whether {repo.name} belongs on GitHub",
+            "This repository has no origin remote. Publish it or explicitly keep it local-only.",
+            f"{cd} && git remote -v", repo.name,
+        ))
+    elif repo.branch not in MAIN_BRANCHES and not repo.upstream:
+        recommendations.append(Recommendation(
+            90, "github", f"Give {repo.name}'s branch a destination",
+            f"{repo.branch} has no upstream. Push it for a PR, merge it locally, or park it deliberately.",
+            f"{cd} && git status -sb", repo.name,
+        ))
+    elif repo.branch not in MAIN_BRANCHES and repo.clean and (repo.age_days or 0) >= 10:
+        recommendations.append(Recommendation(
+            84, "github", f"Decide the fate of {repo.name}'s branch",
+            f"{repo.branch} is clean but its last commit was {repo.age_days} days ago.",
+            f"{cd} && git log --oneline --decorate -8", repo.name,
+        ))
+
+    # Suppressed while no repo in the workspace has a workflow yet: there is no
+    # starter to copy, so the fleet-wide card in workspace_recommendations is the
+    # honest first step and these would only duplicate it once per repo.
+    if starter_exists and repo.has_tests and not repo.has_workflow:
+        recommendations.append(Recommendation(
+            62, "workflow", f"Put {repo.name}'s checks on autopilot",
+            f"It looks like a {repo.technology} project with tests/checks but no GitHub Actions workflow.",
+            f"{cd} && mkdir -p .github/workflows", repo.name,
+        ))
+    if repo.clean and not repo.has_readme:
+        recommendations.append(Recommendation(
+            46, "organize", f"Leave a map for future-you in {repo.name}",
+            "Add a short README covering purpose, status, and the next meaningful action.",
+            f"{cd}", repo.name,
+        ))
+    return recommendations
+
+
+def github_recommendations(snapshot: GithubSnapshot, now: datetime) -> list[Recommendation]:
+    if not snapshot.available:
+        return []
+    recommendations: list[Recommendation] = []
+    for pr in snapshot.review_requests or []:
+        repository = (pr.get("repository") or {}).get("nameWithOwner", "GitHub")
+        recommendations.append(Recommendation(
+            102, "github", f"Review {repository}#{pr.get('number')}",
+            pr.get("title", "A pull request is waiting for you."),
+            f"gh pr view {pr.get('number')} --repo {repository} --web", repository, "github",
+        ))
+    for pr in snapshot.open_prs or []:
+        updated = pr.get("updatedAt")
+        age = 0
+        if updated:
+            try:
+                age = (now - datetime.fromisoformat(updated.replace("Z", "+00:00"))).days
+            except ValueError:
+                pass
+        if pr.get("isDraft") or age >= 4:
+            repository = (pr.get("repository") or {}).get("nameWithOwner", "GitHub")
+            state = "draft" if pr.get("isDraft") else f"quiet for {age} days"
+            recommendations.append(Recommendation(
+                86 + min(age, 10), "github", f"Unstick {repository}#{pr.get('number')}",
+                f"This PR is {state}: {pr.get('title', 'untitled')}",
+                f"gh pr view {pr.get('number')} --repo {repository} --web", repository, "github",
+            ))
+    return recommendations
+
+
+def workspace_recommendations(root: Path, repos: list[Repo]) -> list[Recommendation]:
+    recommendations: list[Recommendation] = []
+    recipes = sorted((root / "Scripts").glob("*.rtf")) if (root / "Scripts").is_dir() else []
+    if recipes:
+        names = ", ".join(path.stem for path in recipes[:3])
+        recommendations.append(Recommendation(
+            70, "terminal", "Promote one terminal recipe into a real command",
+            f"Your Scripts folder still has {len(recipes)} RTF recipe(s): {names}. Make the most-used one executable and searchable.",
+            f"cd {shell_path(str(root / 'Scripts'))}",
+        ))
+
+    workflow_count = sum(repo.has_workflow for repo in repos)
+    testable = sum(repo.has_tests for repo in repos)
+    if testable and workflow_count == 0:
+        recommendations.append(Recommendation(
+            68, "workflow", "Build one reusable GitHub Actions starter",
+            f"None of these {len(repos)} active repos has a workflow, while {testable} appear to expose tests or checks.",
+            f"cd {shell_path(str(root / '_tools'))}",
+        ))
+
+    clean_old = [repo for repo in repos if repo.clean and (repo.age_days or 0) >= 60]
+    if clean_old:
+        oldest = max(clean_old, key=lambda repo: repo.age_days or 0)
+        recommendations.append(Recommendation(
+            52, "organize", f"Give {oldest.name} an explicit status",
+            f"It is clean and has been quiet for {oldest.age_days} days. Mark it active, paused, or archived without changing its code.",
+            f"cd {shell_path(oldest.path)} && git log -1 --oneline", oldest.name,
+        ))
+
+    return recommendations
+
+
+def all_recommendations(root: Path, repos: list[Repo], github: GithubSnapshot) -> list[Recommendation]:
+    starter_exists = any(repo.has_workflow for repo in repos)
+    items = [item for repo in repos for item in repo_recommendations(repo, starter_exists)]
+    items.extend(github_recommendations(github, datetime.now(timezone.utc)))
+    items.extend(workspace_recommendations(root, repos))
+    return sorted(items, key=lambda item: (-item.score, item.category, item.title.lower()))
+
+
+def select_recommendations(items: list[Recommendation], vibe: str, limit: int) -> list[Recommendation]:
+    if vibe != "anything":
+        return [item for item in items if item.category == vibe][:limit]
+    if not items:
+        return []
+
+    selected: list[Recommendation] = []
+    used_categories: set[str] = set()
+    used_repos: set[str] = set()
+    for item in items:
+        if item.category in used_categories or (item.repo and item.repo in used_repos):
+            continue
+        selected.append(item)
+        used_categories.add(item.category)
+        if item.repo:
+            used_repos.add(item.repo)
+        if len(selected) >= limit:
+            return selected
+    for item in items:
+        if item not in selected and (not item.repo or item.repo not in used_repos):
+            selected.append(item)
+            if item.repo:
+                used_repos.add(item.repo)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+# --------------------------------------------------------------------------
+# The ideas band
+#
+# Everything above this point is derived: pulse reads local state and says what
+# that state implies. Nothing in git can imply "write an agent for this", so the
+# band below is written by a model, on request only, and persists verbatim until
+# the user asks for another pass. Pulse never regenerates it on its own — no
+# timer, no scan trigger — because an idea list that churns underneath you is
+# the thing this band exists to avoid.
+# --------------------------------------------------------------------------
+
+
+class IdeaError(RuntimeError):
+    """A refresh that could not produce trustworthy ideas. Stored ideas survive."""
+
+
+def load_ideas(path: Path) -> dict[str, Any]:
+    stored = read_state(path).get("ideas")
+    if not isinstance(stored, dict):
+        return {"items": [], "done": []}
+    items = [entry for entry in stored.get("items", []) if valid_idea(entry)]
+    done = [entry for entry in stored.get("done", []) if isinstance(entry, dict) and isinstance(entry.get("id"), str)]
+    return {**stored, "items": items, "done": done}
+
+
+def save_ideas(path: Path, ideas: dict[str, Any]) -> None:
+    write_state(path, {**read_state(path), "ideas": ideas})
+
+
+def valid_idea(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("kind") not in IDEA_KINDS:
+        return False
+    return all(isinstance(entry.get(field), str) and entry[field].strip() for field in ("title", "detail", "prompt"))
+
+
+def idea_recommendation(entry: dict[str, Any]) -> Recommendation:
+    """An idea rides the Recommendation shape so numbering, dismissal, the
+    listing file, and Enter-to-copy all work on it unchanged. It keeps its own
+    list end to end, so it never competes with a dirty repo for a runway slot."""
+    return Recommendation(
+        score=0,
+        category=entry["kind"],
+        title=entry["title"].strip(),
+        detail=entry["detail"].strip(),
+        command=None,
+        repo=None,
+        source="idea",
+        prompt=entry["prompt"].strip(),
+    )
+
+
+def visible_ideas(
+    ideas: dict[str, Any], dismissals: list[dict[str, Any]], kind: str | None = None
+) -> list[Recommendation]:
+    hidden = {entry["id"] for entry in dismissals} | {entry["id"] for entry in ideas.get("done", [])}
+    items = [idea_recommendation(entry) for entry in ideas.get("items", [])]
+    return [item for item in items if item.id not in hidden and (kind is None or item.category == kind)]
+
+
+def mark_idea_done(path: Path, ideas: dict[str, Any], item: Recommendation) -> dict[str, Any]:
+    if any(entry["id"] == item.id for entry in ideas.get("done", [])):
+        return ideas
+    updated = {
+        **ideas,
+        "done": [
+            *ideas.get("done", []),
+            {
+                "id": item.id,
+                "title": item.title,
+                "kind": item.category,
+                "done_at": datetime.now(timezone.utc).isoformat(),
+            },
+        ],
+    }
+    save_ideas(path, updated)
+    return updated
+
+
+def read_head(path: Path, lines: int) -> str | None:
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            return "".join(next(handle, "") for _ in range(lines)).strip() or None
+    except OSError:
+        return None
+
+
+def workspace_tooling(root: Path, repos: list[Repo]) -> list[str]:
+    """What the workspace can already do — so the model proposes something new."""
+    names: list[str] = []
+    for folder in ("_tools", "Scripts", DEFAULT_WORKFLOWS_DIR):
+        directory = root / folder
+        if not directory.is_dir():
+            continue
+        names.extend(
+            f"{folder}/{entry.name}"
+            for entry in sorted(directory.iterdir())
+            if not entry.name.startswith(".")
+        )
+    if (root / "COMMANDS").is_file():
+        names.append("COMMANDS")
+    names.extend(f"{repo.name}/COMMANDS" for repo in repos if (Path(repo.path) / "COMMANDS").is_file())
+    return names
+
+
+def build_idea_pack(
+    root: Path, repos: list[Repo], ideas: dict[str, Any], dismissals: list[dict[str, Any]], need: int
+) -> dict[str, Any]:
+    live = visible_ideas(ideas, dismissals)
+    readmes: dict[str, str] = {}
+    for repo in repos:
+        readme = read_head(Path(repo.path) / "README.md", IDEA_README_LINES)
+        if readme:
+            readmes[repo.name] = readme
+    ledger = None
+    ledger_path = root / "LEDGER.md"
+    if ledger_path.is_file():
+        try:
+            ledger = recent_ledger_entries(ledger_path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            ledger = None
+    hidden = {entry["id"] for entry in dismissals}
+    shelved = [entry for entry in ideas.get("items", []) if idea_recommendation(entry).id in hidden]
+    return {
+        "root": str(root),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "need": need,
+        "kinds": list(IDEA_KINDS),
+        "repositories": [
+            {
+                "name": repo.name,
+                "technology": repo.technology,
+                "branch": repo.branch,
+                "age_days": repo.age_days,
+                "has_tests": repo.has_tests,
+                "has_workflow": repo.has_workflow,
+                "has_readme": repo.has_readme,
+                "has_remote": bool(repo.remote),
+            }
+            for repo in repos
+        ],
+        "tooling": workspace_tooling(root, repos),
+        "readmes": readmes,
+        "ledger": ledger,
+        # The anti-repetition levers: what the band already says, and what the
+        # user has already built. A refresh that restates either is wasted.
+        "existing_ideas": [{"kind": item.category, "title": item.title} for item in live],
+        "recent_done": [
+            {"kind": entry.get("kind"), "title": entry.get("title")} for entry in ideas.get("done", [])[-12:]
+        ],
+        "dismissed": [{"kind": entry["kind"], "title": entry["title"]} for entry in shelved],
+    }
+
+
+def recent_ledger_entries(text: str, entries: int = IDEA_LEDGER_ENTRIES) -> str | None:
+    """The newest entries only. The preamble explains the file, not the work, and
+    an entry count is a steadier budget than a character count as bodies grow."""
+    start = text.find("\n## ")
+    body = text[start + 1 :] if start != -1 else text
+    pieces = body.split("\n- ")  # pieces[0] is the first day heading
+    kept = "\n- ".join(pieces[: entries + 1]).strip()
+    return kept[:IDEA_LEDGER_CHARACTERS] or None
+
+
+IDEA_INSTRUCTIONS = """You are writing the "worth considering" band of Project Pulse, a terminal
+dashboard over one developer's ~/Projects workspace.
+
+The rest of the dashboard already reports what local git state implies: dirty trees,
+unpushed branches, missing READMEs. Do not duplicate that. Your band exists for the
+things no scan can infer.
+
+Write exactly {need} ideas as JSON. Rules:
+
+- Each idea names something that does not exist yet: a new automation, an agent or
+  pipeline, a script or command, or a technology worth adopting here.
+- Spread across the kinds {kinds}. Do not return two ideas of the same kind while
+  another kind is missing.
+- Be ambitious and specific to THIS workspace. Refactors, cleanups, "add tests",
+  "improve documentation", and "increase coverage" are explicitly out of scope —
+  another part of the dashboard covers maintenance.
+- Do not restate anything in existing_ideas or recent_done.
+- "prompt" is a complete, ready-to-paste instruction for a coding agent that will
+  build the idea: what to build, where in the workspace it lands, what it must not
+  break, and how to tell it worked. Write it to be pasted with no editing.
+
+Return ONLY this JSON, no prose and no code fence:
+
+{{"ideas": [{{"kind": "automation|agent|script|tech", "title": "short imperative line",
+"detail": "one or two sentences on why this is worth doing here",
+"prompt": "the full build-it prompt"}}]}}
+
+Here is the workspace:
+
+"""
+
+
+def extract_json(text: str) -> Any:
+    """Tolerate a fenced or prose-wrapped object; reject anything else loudly."""
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.split("\n", 1)[-1]
+        if stripped.rstrip().endswith("```"):
+            stripped = stripped.rstrip()[: -len("```")]
+    start, end = stripped.find("{"), stripped.rfind("}")
+    if start == -1 or end <= start:
+        raise IdeaError("the model returned no JSON object")
+    try:
+        return json.loads(stripped[start : end + 1])
+    except ValueError as error:
+        raise IdeaError(f"the model returned unparseable JSON: {error}") from error
+
+
+def parse_ideas(payload: Any) -> list[dict[str, str]]:
+    entries = payload.get("ideas") if isinstance(payload, dict) else payload
+    if not isinstance(entries, list) or not entries:
+        raise IdeaError("no ideas in the payload")
+    parsed: list[dict[str, str]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise IdeaError("an idea was not an object")
+        candidate = {
+            "kind": str(entry.get("kind", "")).strip().lower(),
+            "title": str(entry.get("title", "")).strip(),
+            "detail": str(entry.get("detail", "")).strip(),
+            "prompt": str(entry.get("prompt", "")).strip(),
+        }
+        if not valid_idea(candidate):
+            raise IdeaError(f"an idea was incomplete or had an unknown kind: {candidate['kind'] or '(none)'}")
+        parsed.append(candidate)
+    return parsed
+
+
+def idea_key(entry: dict[str, str]) -> tuple[str, str]:
+    return entry["kind"], entry["title"].lower()
+
+
+def enforce_spread(existing: list[dict[str, str]], incoming: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Hold back an incoming idea that would crowd its kind while another kind is absent.
+
+    Enforced here rather than trusted to the model, and enforced on what comes
+    in rather than on the band: a kept idea is the user's, so a crowded pass
+    ends one idea short instead of costing them one. An idea held back early
+    is admitted at the end if the rest of the pass filled every kind, since
+    repetition is only repetition while something else is missing.
+    """
+    counts = {kind: 0 for kind in IDEA_KINDS}
+    for entry in existing:
+        counts[entry["kind"]] += 1
+    accepted: list[dict[str, str]] = []
+    deferred: list[dict[str, str]] = []
+    for entry in incoming:
+        if counts[entry["kind"]] >= 2 and any(count == 0 for count in counts.values()):
+            deferred.append(entry)
+            continue
+        counts[entry["kind"]] += 1
+        accepted.append(entry)
+    if all(counts.values()):
+        accepted.extend(deferred)
+    return accepted
+
+
+def merge_ideas(
+    existing: list[dict[str, str]], incoming: list[dict[str, str]], free: int
+) -> list[dict[str, str]]:
+    """Fill `free` slots from incoming; never touch, drop, or reorder an existing idea."""
+    seen = {idea_key(entry) for entry in existing}
+    fresh: list[dict[str, str]] = []
+    for entry in incoming:
+        key = idea_key(entry)
+        if key in seen:
+            continue
+        seen.add(key)
+        fresh.append(entry)
+    return [*existing, *enforce_spread(existing, fresh)[: max(0, free)]]
+
+
+def free_idea_slots(ideas: dict[str, Any], dismissals: list[dict[str, Any]], limit: int) -> int:
+    return max(0, limit - len(visible_ideas(ideas, dismissals)))
+
+
+def band_full_reason(limit: int) -> str:
+    return (
+        f"the band is full ({limit}/{limit}); retire one with 'pulse did N', "
+        "dismiss one, or raise --ideas"
+    )
+
+
+def generate_ideas(pack: dict[str, Any], model: str = IDEA_MODEL, timeout: int = IDEA_TIMEOUT_SECONDS) -> list[dict[str, str]]:
+    """Ask the model for ideas. Any failure raises; the caller keeps what it had."""
+    executable = shutil.which("claude")
+    if executable is None:
+        raise IdeaError("the claude CLI is not on PATH")
+    instructions = IDEA_INSTRUCTIONS.format(need=pack["need"], kinds=", ".join(IDEA_KINDS))
+    completed = run(
+        [executable, "-p", "--model", model, "--output-format", "json", "--restricted"],
+        timeout=timeout,
+        stdin=instructions + json.dumps(pack, indent=2),
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "no output").strip().splitlines()
+        raise IdeaError(f"claude exited {completed.returncode}: {detail[-1] if detail else 'no output'}")
+    try:
+        envelope = json.loads(completed.stdout)
+    except ValueError as error:
+        raise IdeaError(f"claude did not return JSON: {error}") from error
+    if isinstance(envelope, dict) and envelope.get("is_error"):
+        raise IdeaError(str(envelope.get("result", "claude reported an error")))
+    result = envelope.get("result") if isinstance(envelope, dict) else None
+    if not isinstance(result, str):
+        raise IdeaError("claude returned no result text")
+    return parse_ideas(extract_json(result))
+
+
+def refresh_ideas(
+    path: Path, root: Path, repos: list[Repo], dismissals: list[dict[str, Any]], model: str, limit: int = IDEA_LIMIT
+) -> dict[str, Any]:
+    stored = load_ideas(path)
+    need = free_idea_slots(stored, dismissals, limit)
+    if need == 0:
+        raise IdeaError(band_full_reason(limit))
+    pack = build_idea_pack(root, repos, stored, dismissals, need)
+    incoming = generate_ideas(pack, model)
+    return store_ideas(path, stored, dismissals, incoming, limit, model)
+
+
+def store_ideas(
+    path: Path,
+    stored: dict[str, Any],
+    dismissals: list[dict[str, Any]],
+    incoming: list[dict[str, str]],
+    limit: int,
+    model: str,
+) -> dict[str, Any]:
+    """Refill only what the user retired; an untouched idea survives every write.
+
+    A dismissed idea is hidden, not retired: it stays stored so `pulse restore`
+    has something to bring back, and its title stays off the incoming list so
+    a refresh cannot smuggle it back under the same name.
+    """
+    done = {entry["id"] for entry in stored.get("done", [])}
+    hidden = {entry["id"] for entry in dismissals}
+    kept = [entry for entry in stored.get("items", []) if idea_recommendation(entry).id not in done]
+    shelved = [entry for entry in kept if idea_recommendation(entry).id in hidden]
+    band = [entry for entry in kept if idea_recommendation(entry).id not in hidden]
+    shelved_keys = {idea_key(entry) for entry in shelved}
+    fresh = [entry for entry in incoming if idea_key(entry) not in shelved_keys]
+    updated = {
+        **stored,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "model": model,
+        "items": [*merge_ideas(band, fresh, limit - len(band)), *shelved],
+    }
+    save_ideas(path, updated)
+    return updated
+
+
+@dataclass
+class Slot:
+    """One numbered line of the live pane. The number is owned for the session."""
+
+    number: int
+    item: Recommendation
+    resolved_at: datetime | None = None
+
+    @property
+    def resolved(self) -> bool:
+        return self.resolved_at is not None
+
+
+class LiveSession:
+    """The live pane's numbering: assigned once per item, never reused.
+
+    A slot whose item disappears from a fresh scan is marked resolved and keeps
+    its ✓ on screen for RESOLVED_LINGER_SECONDS. The pane then refills to the
+    limit with new items on fresh numbers. If a resolved item's condition comes
+    back later, it reclaims the number it already owned — a number never means
+    two different things inside one session.
+    """
+
+    def __init__(self, vibe: str, limit: int):
+        self.vibe = vibe
+        self.limit = limit
+        self.slots: dict[str, Slot] = {}
+        self.idea_slots: dict[str, Slot] = {}
+        self.next_number = 1
+
+    def refresh(
+        self, visible: list[Recommendation], now: datetime, hidden: frozenset[str] = frozenset()
+    ) -> list[Slot]:
+        fresh = {item.id: item for item in visible}
+        for identity, slot in self.slots.items():
+            if identity in fresh:
+                slot.item = fresh[identity]  # counts in the detail text may have moved
+                slot.resolved_at = None
+            elif slot.resolved_at is None:
+                slot.resolved_at = now
+
+        active = sum(1 for slot in self.slots.values() if not slot.resolved)
+        if active < self.limit:
+            candidates = [item for item in visible if item.id not in self.slots]
+            for item in select_recommendations(candidates, self.vibe, self.limit - active):
+                self.slots[item.id] = Slot(self.next_number, item)
+                self.next_number += 1
+
+        shown = [
+            slot
+            for slot in self.slots.values()
+            if slot.item.id not in hidden  # dismissed by hand: leave silently, no ✓
+            and (
+                not slot.resolved
+                or (now - slot.resolved_at).total_seconds() < RESOLVED_LINGER_SECONDS
+            )
+        ]
+        return sorted(shown, key=lambda slot: slot.number)
+
+
+    def refresh_ideas(self, ideas: list[Recommendation]) -> list[Slot]:
+        """Ideas draw from the same number counter but never resolve on their own.
+
+        Nothing in a scan can clear an idea, so there is no ✓ state here: an idea
+        leaves only when the user retires it with `did` or hides it with `dismiss`.
+        """
+        fresh = {item.id: item for item in ideas}
+        for identity in list(self.idea_slots):
+            if identity in fresh:
+                self.idea_slots[identity].item = fresh[identity]
+            else:
+                del self.idea_slots[identity]
+        for item in ideas:
+            if item.id not in self.idea_slots:
+                self.idea_slots[item.id] = Slot(self.next_number, item)
+                self.next_number += 1
+        return sorted(self.idea_slots.values(), key=lambda slot: slot.number)
+
+
+class Palette:
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+
+    def paint(self, code: str, value: str) -> str:
+        return f"\033[{code}m{value}\033[0m" if self.enabled else value
+
+    def bold(self, value: str) -> str:
+        return self.paint("1", value)
+
+    def dim(self, value: str) -> str:
+        return self.paint("2", value)
+
+    def category(self, value: str) -> str:
+        colors = {
+            "hygiene": "250;84;185",
+            "github": "145;90;240",
+            "workflow": "72;124;240",
+            "organize": "26;153;123",
+            "build": "235;93;72",
+            "terminal": "215;145;35",
+            "automation": "0;175;185",
+            "agent": "210;120;255",
+            "script": "150;195;70",
+            "tech": "250;205;90",
+        }
+        label = f"[{value.upper():^10}]"
+        return self.paint(f"1;38;2;{colors.get(value, '166;169;178')}", label)
+
+    def muted(self, value: str) -> str:
+        return self.paint("38;2;116;120;132", value)
+
+    def fog(self, value: str) -> str:
+        return self.paint("38;2;211;210;216", value)
+
+    def signal(self, value: str) -> str:
+        return self.paint("38;2;250;84;185", value)
+
+    def ready(self, value: str) -> str:
+        return self.paint("1;38;2;26;153;123", value)
+
+    def violet(self, value: str) -> str:
+        return self.paint("38;2;155;104;255", value)
+
+    def selection_badge(self, value: str, signal_visible: bool = True) -> str:
+        if not self.enabled:
+            return f"[{value}]" if signal_visible else f" {value} "
+        background = "250;84;185" if signal_visible else "211;210;216"
+        return self.paint(f"1;38;2;32;33;38;48;2;{background}", f" {value} ")
+
+    def gradient(
+        self,
+        value: str,
+        start: tuple[int, int, int] = (255, 76, 176),
+        end: tuple[int, int, int] = (139, 99, 255),
+    ) -> str:
+        if not self.enabled or not value:
+            return value
+        last = max(1, len(value) - 1)
+        pieces: list[str] = []
+        for index, character in enumerate(value):
+            if character == " ":
+                pieces.append(character)
+                continue
+            ratio = index / last
+            red = round(start[0] + (end[0] - start[0]) * ratio)
+            green = round(start[1] + (end[1] - start[1]) * ratio)
+            blue = round(start[2] + (end[2] - start[2]) * ratio)
+            pieces.append(f"\033[38;2;{red};{green};{blue}m{character}")
+        pieces.append("\033[0m")
+        return "".join(pieces)
+
+    def plate(self, value: str, width: int) -> str:
+        value = value[:width].rstrip()
+        if not self.enabled:
+            return value
+        # ANSI background cells are opaque, even when Terminal's own background
+        # is translucent. Keep this secondary band on the terminal's default
+        # background so it does not turn into a bright slab over blur.
+        return self.paint("1;38;2;166;169;178", value)
+
+
+def dashboard_width() -> int:
+    columns = shutil.get_terminal_size(fallback=(104, 36)).columns
+    return max(DASHBOARD_MIN_WIDTH, min(columns, DASHBOARD_MAX_WIDTH))
+
+
+def dashboard_height() -> int:
+    return shutil.get_terminal_size(fallback=(104, 36)).lines
+
+
+def terminal_columns() -> int:
+    """The real column count, unclamped, for deciding whether the pane fits at all."""
+    return shutil.get_terminal_size(fallback=(104, 36)).columns
+
+
+def viewport_below_floor() -> bool:
+    return terminal_columns() < DASHBOARD_MIN_WIDTH or dashboard_height() < DASHBOARD_MIN_HEIGHT
+
+
+def print_floor_notice(palette: Palette) -> None:
+    """What the live pane shows when even its smallest layout does not fit.
+
+    Every line clips to the real width, so nothing wraps and nothing scrolls;
+    the dashboard comes back on the next resize.
+    """
+    width = max(1, min(terminal_columns(), DASHBOARD_MAX_WIDTH))
+    for row in wordmark_rows(1):
+        shown = clip_text(row, width)
+        print(" " * max(0, (width - len(shown)) // 2) + palette.gradient(shown))
+    print()
+    notice = clip_text(f"MAKE THE WINDOW {DASHBOARD_MIN_WIDTH}x{DASHBOARD_MIN_HEIGHT} OR LARGER", width)
+    print(" " * max(0, (width - len(notice)) // 2) + palette.muted(notice))
+
+
+def clip_text(value: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(value) <= width:
+        return value
+    if width == 1:
+        return "…"
+    return value[: width - 1].rstrip() + "…"
+
+
+def spread_line(left: str, right: str, width: int, fill: str = " ") -> str:
+    if not right:
+        return clip_text(left, width)
+    if len(left) + len(right) + 1 > width:
+        left = clip_text(left, max(1, width - len(right) - 1))
+    gap = max(1, width - len(left) - len(right))
+    return clip_text(left + fill * gap + right, width)
+
+
+def rule_line(left: str, right: str, width: int) -> str:
+    return spread_line(left, right, width, "─")
+
+
+def wordmark_rows(horizontal_scale: int = 2) -> list[str]:
+    letters = "PULSE"
+    logical_height = len(next(iter(WORDMARK_GLYPHS.values()))) + max(WORDMARK_OFFSETS)
+    logical_width = len(letters) * 5 * horizontal_scale + (len(letters) - 1) * horizontal_scale
+    pixels = [[False for _column in range(logical_width)] for _row in range(logical_height)]
+    column = 0
+    for letter, offset in zip(letters, WORDMARK_OFFSETS):
+        glyph = WORDMARK_GLYPHS[letter]
+        for glyph_row, pattern in enumerate(glyph):
+            for glyph_column, filled in enumerate(pattern):
+                if filled == "1":
+                    start = column + glyph_column * horizontal_scale
+                    for scaled_column in range(start, start + horizontal_scale):
+                        pixels[glyph_row + offset][scaled_column] = True
+        column += 6 * horizontal_scale
+
+    rows: list[str] = []
+    for upper_row in range(0, logical_height, 2):
+        lower_row = upper_row + 1
+        characters: list[str] = []
+        for pixel_column in range(logical_width):
+            upper = pixels[upper_row][pixel_column]
+            lower = lower_row < logical_height and pixels[lower_row][pixel_column]
+            characters.append("█" if upper and lower else "▀" if upper else "▄" if lower else " ")
+        rows.append("".join(characters))
+    return rows
+
+
+def wordmark_scale(width: int) -> int:
+    """Keep the masthead compact until the pane is genuinely wide."""
+    return 2 if width >= 120 else 1
+
+
+def print_masthead(
+    palette: Palette, width: int, now: datetime, live: bool, label: str = "RECOMMENDATION INDEX"
+) -> None:
+    state = "LIVE SIGNAL" if live else "STATIC SCAN"
+    stamp = now.strftime("%a %b %-d / %-I:%M %p")
+    left = f"PROJECT PULSE // {label}"
+    right = f"{stamp} / {state}"
+    plain = spread_line(left, right, width)
+    state_at = plain.rfind(state)
+    if state_at >= 0 and live:
+        print(palette.muted(plain[:state_at]) + palette.signal(plain[state_at:]))
+    else:
+        print(palette.muted(plain))
+    scale = wordmark_scale(width)
+    for row in wordmark_rows(scale):
+        padding = " " * max(0, (width - len(row)) // 2)
+        print(padding + palette.gradient(row))
+
+
+def pack_segments(segments: list[str], width: int) -> list[str]:
+    lines: list[str] = []
+    current = ""
+    for segment in segments:
+        candidate = segment if not current else f"{current}  │  {segment}"
+        if current and len(candidate) > width:
+            lines.append(current)
+            current = segment
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
+def github_status(
+    github: GithubSnapshot,
+    github_fetched_at: datetime | None = None,
+    github_is_fresh: bool = True,
+) -> str:
+    if not github.available:
+        return "GITHUB OFFLINE"
+    if not github_is_fresh and github_fetched_at is not None:
+        stamp = github_fetched_at.astimezone().strftime("%-I:%M %p")
+        return f"GITHUB @{github.user} / AS OF {stamp}"
+    return f"GITHUB @{github.user}"
+
+
+def instrument_segments(
+    repos: list[Repo],
+    github: GithubSnapshot,
+    github_fetched_at: datetime | None = None,
+    github_is_fresh: bool = True,
+) -> list[str]:
+    dirty = sum(not repo.clean for repo in repos)
+    branches = sum(repo.branch not in MAIN_BRANCHES for repo in repos)
+    no_remote = sum(not repo.remote for repo in repos)
+    return [
+        f"{len(repos):02d} REPOSITORIES",
+        f"{dirty:02d} OPEN LOOPS",
+        f"{branches:02d} TOPIC BRANCHES",
+        f"{no_remote:02d} LOCAL ONLY",
+        github_status(github, github_fetched_at, github_is_fresh),
+    ]
+
+
+def print_instrument_band(
+    root: Path,
+    repos: list[Repo],
+    github: GithubSnapshot,
+    palette: Palette,
+    width: int,
+    github_fetched_at: datetime | None = None,
+    github_is_fresh: bool = True,
+) -> None:
+    workspace = clip_text(str(root), max(18, width - 28))
+    print(palette.plate(spread_line(f"  WORKSPACE / {workspace}", "SCAN 01 / LOCAL INDEX  ", width), width))
+    segments = instrument_segments(repos, github, github_fetched_at, github_is_fresh)
+    for line in pack_segments(segments, width - 4):
+        print(palette.plate(f"  {line}", width))
+
+
+AGENT_ICON_FRAMES = {
+    "still": (
+        ("╭─────╮", "│ ▌ ▐ │", "╰─────╯"),
+        ("╭─────╮", "│ ▌ ▐ │", "╰─────╯"),
+        ("╭─────╮", "│ ▌ ▐ │", "╰─────╯"),
+    ),
+    "thinking": (
+        ("╭─────╮", "│ ·   │", "╰─────╯"),
+        ("╭─────╮", "│ ··  │", "╰─────╯"),
+        ("╭─────╮", "│ ··· │", "╰─────╯"),
+    ),
+    "editing": (
+        ("╭─────╮", "│ ≡╱◆ │", "╰─────╯"),
+        ("╭─────╮", "│ ◆╲≡ │", "╰─────╯"),
+        ("╭─────╮", "│ ≡╱◆ │", "╰─────╯"),
+    ),
+    "finishing": (
+        ("╭─────╮", "│ ·✓· │", "╰─────╯"),
+        ("╭─────╮", "│ ✦✓✦ │", "╰─────╯"),
+        ("╭─────╮", "│ ·✓· │", "╰─────╯"),
+    ),
+    "waiting": (
+        ("╭─────╮", "│ >>  │", "╰─────╯"),
+        ("╭─────╮", "│  >  │", "╰─────╯"),
+        ("╭─────╮", "│ >>  │", "╰─────╯"),
+    ),
+}
+AGENT_ICON_EMPTY = ("╭─────╮", "│     │", "╰─────╯")  # the guard an empty position keeps
+AGENT_ICON_WIDTH = 7
+AGENT_STRIP_ROWS = 7  # provider mark, three icon rows, project, time in state, activity
+AGENT_BAND_ACTIVE_ROWS = 1 + AGENT_STRIP_ROWS
+AGENT_BAND_COLLAPSED_ROWS = 1
+AGENT_STRIP_MIN_WIDTH = 10
+AGENT_GRID_MIN_COLUMNS = 2
+AGENT_GRID_MAX_COLUMNS = 6
+AGENT_INSTRUMENT_CODE = "AGT/01"
+
+
+def agent_icon_frame(state: str, frame: int) -> tuple[str, str, str]:
+    frames = AGENT_ICON_FRAMES.get(state) or AGENT_ICON_FRAMES["still"]
+    return frames[frame % len(frames)]
+
+
+def agent_grid_columns(width: int) -> int:
+    """Fit whole cards only: 60→6, 50→5, 40→4, 30→3, 20→2."""
+    return min(AGENT_GRID_MAX_COLUMNS, width // AGENT_STRIP_MIN_WIDTH)
+
+
+def agent_strip_width(
+    width: int,
+    columns: int = AGENT_GRID_MAX_COLUMNS,
+    framed: bool = True,
+) -> int:
+    """One equal card width, reserving exterior walls only in the wide layout."""
+    return (width - 2 if framed else width) // columns
+
+
+def agent_band_height(band: AgentBand | None) -> int:
+    return AGENT_BAND_ACTIVE_ROWS if band is not None and band.active else AGENT_BAND_COLLAPSED_ROWS
+
+
+def agent_time_in_state(now: datetime, since: datetime | None) -> str:
+    if since is None:
+        return "0:00"
+    seconds = max(0, int((now - since).total_seconds()))
+    if seconds < 3600:
+        return f"{seconds // 60}:{seconds % 60:02d}"
+    hours, rest = divmod(seconds, 3600)
+    return f"{hours}h{rest // 60:02d}"
+
+
+def agent_strip_cells(strip: AgentStrip | None, width: int, frame: int, now: datetime) -> list[str]:
+    """Seven plain rows, each exactly `width` cells, for one position."""
+    inset = max(0, (width - AGENT_ICON_WIDTH) // 2)
+    room = width - inset
+
+    def line(value: str) -> str:
+        return (" " * inset + clip_text(value, room)).ljust(width)[:width]
+
+    if strip is None:
+        return [line("")] + [line(row) for row in AGENT_ICON_EMPTY] + [line("")] * 3
+    session = strip.session
+    mark = session.provider.upper() + (f" +{session.subagents}" if session.subagents else "")
+    icon = agent_icon_frame("still" if strip.fading else session.state, frame)
+    return [
+        line(mark),
+        *[line(row) for row in icon],
+        line(session.project),
+        line(agent_time_in_state(now, session.state_since)),  # the icon is the state; this is how long
+        line(session.activity),
+    ]
+
+
+def paint_agent_cell(
+    palette: Palette, strip: AgentStrip | None, row: int, value: str, frame: int
+) -> str:
+    """Paint the card as a quiet field, reserving color for a human handoff.
+
+    The glyph already says what an active session is doing. Giving every
+    provider state its own color made a six-card grid read like a legend before
+    it read like a field. A still card breathes very slowly in graphite; every
+    working glyph uses the same bright ink. Pink is deliberately exceptional:
+    it means the session is waiting on its person.
+    """
+    if strip is None:
+        return palette.dim(palette.muted(value)) if 1 <= row <= 3 else value
+    if strip.fading:
+        return palette.dim(palette.muted(value))
+    if row == 0:
+        return palette.muted(value)
+    if 1 <= row <= 3:
+        if strip.session.state == "waiting":
+            return palette.bold(palette.signal(value))
+        # Quiet cards do not pretend to be active. Their outline lifts once
+        # every four ticks, enough to keep the field from feeling dead without
+        # creating cursor-like noise.
+        if strip.session.state == "still":
+            return palette.fog(value) if frame % 4 == 0 else palette.muted(value)
+        return palette.fog(value)
+    if row == 4:
+        return palette.bold(palette.fog(value))
+    return palette.dim(palette.muted(value))
+
+
+def paint_agent_instrument(palette: Palette, value: str) -> str:
+    """Paint fixed technical frame marks in foreground-only graphite."""
+    return palette.muted(value)
+
+
+def agent_frame_marks(framed: bool) -> tuple[str, str]:
+    """The full-height side walls that sit outside the six agent cards."""
+    return ("│", "│") if framed else ("", "")
+
+
+def agent_band_strips(band: AgentBand) -> list[AgentStrip]:
+    """The stable first row followed by live overflow, in admission order."""
+    strips = [strip for strip in band.positions if strip]
+    strips.extend(AgentStrip(band.sessions[key]) for key in band.queue if key in band.sessions)
+    return strips
+
+
+def agent_band_header(
+    palette: Palette,
+    occupied: int,
+    queued: int,
+    attention: int,
+    width: int,
+    framed: bool,
+) -> str:
+    """A compact equipment label around the existing session count."""
+    sessions = f"{occupied:02d} SESSIONS"
+    if attention:
+        sessions += f" / {attention:02d} NEEDS YOU"
+    if queued:
+        sessions += f" / +{queued} QUEUED"
+    if not framed:
+        left = "// LIVE AGENTS"
+        right = f"{AGENT_INSTRUMENT_CODE} // {sessions}"
+        if len(left) + len(right) + 1 > width:
+            right = f"{occupied:02d}" + ("!" if attention else "") + (f"/+{queued}" if queued else "")
+        plain = spread_line(left, right, width)
+        split_at = plain.rfind(right)
+        return palette.bold(palette.fog(plain[:split_at])) + palette.muted(plain[split_at:])
+    left = "┌─ // LIVE AGENTS"
+    right = f"{AGENT_INSTRUMENT_CODE} // {sessions} ─┐"
+    plain = rule_line(left, right, width)
+    split_at = plain.rfind(right)
+    return (
+        palette.bold(palette.fog(plain[: len(left)]))
+        + palette.muted(plain[len(left) : split_at])
+        + palette.fog(plain[split_at:])
+    )
+
+
+def agent_band_rows(
+    band: AgentBand | None,
+    palette: Palette,
+    width: int,
+    frame: int = 0,
+    now: datetime | None = None,
+    columns: int = AGENT_GRID_MAX_COLUMNS,
+    grid_rows: int = 1,
+    framed: bool = True,
+) -> list[str]:
+    """Render as many complete, equal card rows as the caller gives us."""
+    now = now or datetime.now(timezone.utc)
+    if band is None or not band.active:
+        line = spread_line("// LIVE AGENTS", "STANDBY // 00 SESSIONS", width)
+        return [palette.muted(line)]
+    columns = max(AGENT_GRID_MIN_COLUMNS, min(AGENT_GRID_MAX_COLUMNS, columns))
+    strip_width = agent_strip_width(width, columns, framed)
+    capacity = columns * max(1, grid_rows)
+    strips = agent_band_strips(band)
+    used_rows = min(max(1, grid_rows), max(1, (len(strips) + columns - 1) // columns))
+    capacity = columns * used_rows
+    shown = strips[:capacity]
+    queued = max(0, len(strips) - len(shown))
+    attention = sum(
+        strip is not None and not strip.fading and strip.session.state == "waiting" for strip in shown
+    )
+    rows = [agent_band_header(palette, len(shown), queued, attention, width, framed)]
+    spare = width - (2 if framed else 0) - strip_width * columns
+    for grid_row in range(used_rows):
+        row_strips = shown[grid_row * columns : (grid_row + 1) * columns]
+        row_strips += [None] * (columns - len(row_strips))
+        cells = [agent_strip_cells(strip, strip_width, frame, now) for strip in row_strips]
+        for row in range(AGENT_STRIP_ROWS):
+            left, right = agent_frame_marks(framed)
+            body = "".join(
+                paint_agent_cell(palette, strip, row, cell[row], frame)
+                for strip, cell in zip(row_strips, cells)
+            )
+            rows.append(
+                paint_agent_instrument(palette, left)
+                + body
+                + " " * spare
+                + paint_agent_instrument(palette, right)
+            )
+    return rows
+
+
+def print_runway_header(count: int, palette: Palette, width: int, stamp: str | None = None) -> None:
+    left = "// GOOD NEXT MOVES"
+    right = f"{count:02d} SIGNALS / {stamp or 'PRIORITY DESC'}"
+    plain = spread_line(left, right, width)
+    split_at = plain.rfind(right)
+    print(palette.bold(plain[:split_at]) + palette.muted(plain[split_at:]))
+
+
+def handoff_line(item: Recommendation) -> str:
+    if item.command:
+        return item.command
+    if item.source == "idea":
+        return "build prompt ready / enter copies it"
+    return f"scope / {item.repo or 'workspace'}"
+
+
+def print_selected_recommendation(
+    slot: Slot, palette: Palette, width: int, signal_visible: bool = True
+) -> None:
+    number = palette.selection_badge(f"{slot.number:02d}", signal_visible)
+    category = palette.category(slot.item.category)
+    title = clip_text(slot.item.title, width - 24)
+    print(f"    {number}  {category}  {palette.bold(title)}")
+    print(f"        {palette.muted('REASON /')} {clip_text(slot.item.detail, width - 18)}")
+    handoff = handoff_line(slot.item)
+    print(f"        {palette.muted('↳ ' + clip_text(handoff, width - 12))}")
+
+
+def print_runway_recommendation(slot: Slot, palette: Palette, width: int) -> None:
+    number = palette.bold(f"{slot.number:02d}")
+    category = palette.category(slot.item.category)
+    title = clip_text(slot.item.title, width - 22)
+    print(f"    {number}  {category}  {palette.bold(title)}")
+    print(f"        {palette.muted('REASON /')} {clip_text(slot.item.detail, width - 18)}")
+    handoff = handoff_line(slot.item)
+    print(f"        {palette.muted('↳ ' + clip_text(handoff, width - 12))}")
+
+
+def idea_stamp(generated_at: str | None) -> str:
+    if not generated_at:
+        return "REFRESH ON REQUEST"
+    try:
+        when = datetime.fromisoformat(generated_at).astimezone()
+    except (TypeError, ValueError):
+        return "REFRESH ON REQUEST"
+    return f"WRITTEN {when.strftime('%b %d').upper().replace(' 0', ' ')}"
+
+
+def print_ideas_header(
+    count: int, palette: Palette, width: int, generated_at: str | None, stamp: str | None = None
+) -> None:
+    left = "// WORTH CONSIDERING"
+    right = f"{count:02d} IDEAS / {stamp or idea_stamp(generated_at)}"
+    plain = spread_line(left, right, width)
+    split_at = plain.rfind(right)
+    print(palette.bold(plain[:split_at]) + palette.muted(plain[split_at:]))
+
+
+def print_ideas_band(
+    slots: list[Slot],
+    palette: Palette,
+    width: int,
+    generated_at: str | None = None,
+    selected_id: str | None = None,
+    selection_visible: bool = True,
+    total: int | None = None,
+) -> None:
+    # The header counts the band, not the viewport: a clipped pane still says 05.
+    print_ideas_header(len(slots) if total is None else total, palette, width, generated_at)
+    print()
+    if not slots:
+        print(f"  {palette.muted('NO IDEAS YET / pulse ideas --refresh writes them')}")
+        print()
+        return
+    for slot in slots:
+        if slot.item.id == selected_id:
+            print_selected_recommendation(slot, palette, width, selection_visible)
+        else:
+            print_runway_recommendation(slot, palette, width)
+        print()
+
+
+def compact_pipeline(pipeline: Pipeline) -> str:
+    name = pipeline.name.upper()
+    if pipeline.last_run_at is None:
+        if pipeline.queued:
+            return f"{name} / QUEUED {pipeline.queued} · FIRST RUN PENDING"
+        if pipeline.start_command:
+            return f"{name} / READY · START / {pipeline.start_command}"
+        return f"{name} / STANDBY · FIRST RUN PENDING"
+    ran = datetime.fromisoformat(pipeline.last_run_at).strftime("%b %-d %-I:%M %p")
+    state = f"QUEUED {pipeline.queued}" if pipeline.queued else "IDLE"
+    pieces = [f"{name} / {state}", f"LAST {ran}", f"{pipeline.run_count} RUNS"]
+    if pipeline.review_files:
+        pieces.append(f"{pipeline.review_files} REVIEW RECORDS")
+    return " · ".join(pieces)
+
+
+def rendered_pipeline_summary(pipeline: Pipeline, palette: Palette, width: int) -> str:
+    plain = clip_text(compact_pipeline(pipeline), width)
+    prefix_end = plain.find(" / ") + 3
+    status_end = plain.find(" · ", prefix_end)
+    if prefix_end < 3:
+        return palette.muted(plain)
+    if status_end < 0:
+        status_end = len(plain)
+    status = plain[prefix_end:status_end]
+    paint_status = palette.ready if status in {"READY", "IDLE"} else palette.signal
+    return (
+        palette.bold(plain[:prefix_end])
+        + paint_status(status)
+        + palette.muted(plain[status_end:])
+    )
+
+
+def compact_pipeline_token(pipeline: Pipeline, runs: bool = True) -> str:
+    if pipeline.queued:
+        status = f"QUEUED {pipeline.queued}"
+    elif pipeline.last_run_at:
+        status = "IDLE"
+    elif pipeline.start_command:
+        status = "READY"
+    else:
+        status = "STANDBY"
+    detail = f" · {pipeline.run_count} RUNS" if pipeline.run_count and runs else ""
+    return f"{pipeline.name.upper()} {status}{detail}"
+
+
+def rendered_pipeline_token(pipeline: Pipeline, palette: Palette, runs: bool = True) -> str:
+    plain = compact_pipeline_token(pipeline, runs)
+    name_end = len(pipeline.name)
+    detail_at = plain.find(" · ")
+    status_end = detail_at if detail_at >= 0 else len(plain)
+    status = plain[name_end + 1 : status_end]
+    paint_status = palette.ready if status in {"READY", "IDLE"} else palette.signal
+    return (
+        palette.bold(plain[: name_end + 1])
+        + paint_status(status)
+        + palette.muted(plain[status_end:])
+    )
+
+
+def print_instrument_footer(
+    pipelines: list[Pipeline], palette: Palette, width: int, live: bool
+) -> None:
+    if pipelines:
+        available = width - 3
+        if len(pipelines) == 1:
+            shown = rendered_pipeline_summary(pipelines[0], palette, available)
+        else:
+            # A wrapped footer is a frame one row taller than the terminal,
+            # which the live pane cannot afford: drop the run counts first,
+            # then clip, so the line always stays a line.
+            more = f" ◇ +{len(pipelines) - 3} MORE" if len(pipelines) > 3 else ""
+            plain = " ◇ ".join(compact_pipeline_token(pipeline) for pipeline in pipelines[:3]) + more
+            runs = len(plain) <= available
+            if not runs:
+                plain = " ◇ ".join(compact_pipeline_token(pipeline, runs=False) for pipeline in pipelines[:3]) + more
+            if len(plain) <= available:
+                separator = palette.muted(" ◇ ")
+                shown = separator.join(
+                    rendered_pipeline_token(pipeline, palette, runs) for pipeline in pipelines[:3]
+                ) + (palette.muted(more) if more else "")
+            else:
+                shown = palette.muted(clip_text(plain, available))
+    else:
+        shown = palette.muted(f"NONE DETECTED / add a workflow under {DEFAULT_WORKFLOWS_DIR}/")
+    cadence = "LOCAL 60s / GITHUB 5m" if live else "SNAPSHOT / ON DEMAND"
+    line = rule_line("╶─ AGENT PIPELINES / ", f" {cadence} ─╴", width)
+    label_end = line.find(" / ") + 3
+    print(palette.bold(line[:label_end]) + palette.muted(line[label_end:]))
+    print(f"   {shown}")
+    if live:
+        controls = "↑↓ SELECT  ·  ENTER COPY PROMPT  ·  CTRL-R RESCAN  ·  CTRL-C EXIT"
+    else:
+        controls = "PULSE PROMPT N / HAND OFF  ·  PULSE DISMISS N / HIDE  ·  --VIBE / FILTER"
+    print(f"   {palette.muted(clip_text(controls, width - 3))}")
+
+
+def repo_state(repo: Repo) -> str:
+    if repo.conflicted:
+        return "conflict"
+    if repo.changed:
+        return f"{repo.changed} changes"
+    if repo.ahead or repo.behind:
+        return f"+{repo.ahead}/-{repo.behind}"
+    return "clean"
+
+
+def print_repos(repos: list[Repo], palette: Palette) -> None:
+    print(palette.bold(f"{len(repos)} ACTIVE REPOSITORIES"))
+    print()
+    width = min(34, max([len(repo.name) for repo in repos] + [4]))
+    for repo in repos:
+        if repo.remote:
+            remote = "remote"
+        else:
+            remote = "local-only (declared)" if repo.local_only else "local-only"
+        print(f"  {repo.name[:width]:<{width}}  {repo.branch[:24]:<24}  {repo_state(repo):<12}  {remote}")
+
+
+def print_pipelines(pipelines: list[Pipeline], palette: Palette) -> None:
+    print(palette.bold("AGENT PIPELINES"))
+    print()
+    width = max([len(pipeline.name) for pipeline in pipelines] + [4])
+    for pipeline in pipelines:
+        if pipeline.last_run_at is None:
+            if pipeline.start_command:
+                print(
+                    f"  {pipeline.name:<{width}}  ready · start: {pipeline.start_command}"
+                )
+            else:
+                print(f"  {pipeline.name:<{width}}  never run")
+            continue
+        ran = datetime.fromisoformat(pipeline.last_run_at).strftime("%a %b %-d, %-I:%M %p")
+        pieces = [f"last ran {ran}", f"{pipeline.run_count} run(s)"]
+        if pipeline.queued:
+            pieces.append(f"{pipeline.queued} queued")
+        if pipeline.review_files:
+            pieces.append(f"{pipeline.review_files} review file(s)")
+        print(f"  {pipeline.name:<{width}}  {' · '.join(pieces)}")
+        if pipeline.last_line:
+            print(f"  {'':<{width}}  {palette.dim('last word: ' + pipeline.last_line)}")
+    print()
+
+
+def print_recommendations(items: list[Recommendation], palette: Palette) -> None:
+    if not items:
+        print("  Nothing matched this vibe. Try --vibe anything.")
+        return
+    for index, item in enumerate(items, 1):
+        label = palette.category(item.category)
+        print(f"  {palette.bold(str(index))}  {label} {palette.bold(item.title)}")
+        print(f"     {item.detail}")
+        if item.command:
+            print(f"     {palette.dim('→ ' + item.command)}")
+        print()
+
+
+def print_idea_prompt(item: Recommendation) -> None:
+    """Ideas carry a prompt their generator wrote to be pasted unedited, so
+    nothing precedes it. Only the Pulse ID follows, so an agent transcript can
+    be traced back to the band entry it came from."""
+    print(item.prompt)
+    print()
+    print(f"Pulse ID: {item.id}")
+
+
+def print_agent_prompt(item: Recommendation, root: Path) -> None:
+    if item.source == "idea" and item.prompt:
+        print_idea_prompt(item)
+        return
+    repository = item.repo or "workspace-wide"
+    print("PROJECT PULSE TASK")
+    print()
+    print(f"Please handle this {item.category} task in {root}:")
+    print()
+    print(item.title)
+    print()
+    print(f"Why it was suggested: {item.detail}")
+    print(f"Scope: {repository}")
+    if item.command:
+        print(f"Useful starting point: {item.command}")
+    print()
+    print("Inspect the current state before changing anything. Preserve existing user work, avoid")
+    print("unrelated edits, complete the task safely, and verify the result. Do not discard, stash,")
+    print("overwrite, commit, push, merge, or publish existing work unless that action is clearly")
+    print("authorized by this task; pause and explain when a choice requires user intent.")
+    print()
+    print("When finished, summarize what changed and rerun Project Pulse (or explain what condition")
+    print("still prevents this recommendation from clearing).")
+    print()
+    print(f"Pulse ID: {item.id}")
+
+
+def copy_agent_prompt(item: Recommendation, root: Path) -> bool:
+    prompt = io.StringIO()
+    with redirect_stdout(prompt):
+        print_agent_prompt(item, root)
+    try:
+        subprocess.run(["pbcopy"], input=prompt.getvalue(), text=True, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
+
+
+def print_dismissed(dismissals: list[dict[str, Any]], palette: Palette) -> None:
+    print(palette.bold(f"{len(dismissals)} DISMISSED PULSE ITEM(S)"))
+    print()
+    if not dismissals:
+        print("  Nothing is dismissed.")
+        return
+    for index, item in enumerate(dismissals, 1):
+        category = palette.category(str(item.get("category", "item")))
+        print(f"  {palette.bold(str(index))}  [{category}] {item.get('title', 'Untitled')}")
+        if item.get("repo"):
+            print(f"     {item['repo']}")
+        print(f"     ID: {item['id']}")
+        print()
+    print(palette.dim("  Restore one with: pulse restore NUMBER"))
+
+
+def print_dashboard(
+    root: Path,
+    repos: list[Repo],
+    pipelines: list[Pipeline],
+    github: GithubSnapshot,
+    items: list[Recommendation],
+    palette: Palette,
+    ideas: list[Recommendation] | None = None,
+    ideas_generated_at: str | None = None,
+) -> None:
+    now = datetime.now().astimezone()
+    width = dashboard_width()
+    print_masthead(palette, width, now, live=False)
+    print()
+    print_instrument_band(root, repos, github, palette, width)
+    print()
+    print_runway_header(len(items), palette, width)
+    print()
+    print_live_recommendations(
+        [Slot(index, item) for index, item in enumerate(items, 1)],
+        palette,
+        width=width,
+    )
+    if ideas is not None:
+        print_ideas_band(
+            [Slot(number, item) for number, item in enumerate(ideas, len(items) + 1)],
+            palette,
+            width,
+            ideas_generated_at,
+        )
+    if not github.available and github.error and github.error != "Skipped with --local":
+        print(f"  {palette.muted('GITHUB NOTE / ' + clip_text(github.error, width - 18))}")
+    print_instrument_footer(pipelines, palette, width, live=False)
+
+
+def selectable_slot_ids(slots: list[Slot]) -> list[str]:
+    return [slot.item.id for slot in slots if not slot.resolved]
+
+
+def move_live_selection(slots: list[Slot], selected_id: str | None, offset: int) -> str | None:
+    identities = selectable_slot_ids(slots)
+    if not identities:
+        return None
+    if selected_id not in identities:
+        return identities[0]
+    return identities[(identities.index(selected_id) + offset) % len(identities)]
+
+
+def print_live_recommendations(
+    slots: list[Slot],
+    palette: Palette,
+    selected_id: str | None = None,
+    selection_visible: bool = True,
+    width: int | None = None,
+) -> None:
+    width = width or dashboard_width()
+    if not slots:
+        print(f"  {palette.muted('NO ACTIVE SIGNALS / the pane fills as work appears')}")
+        print()
+        return
+    for slot in slots:
+        if slot.resolved:
+            line = f"    {slot.number:02d}  [{slot.item.category.upper():^10}]  ✓ {slot.item.title}"
+            print(palette.muted(clip_text(line, width)))
+            print()
+            continue
+        if slot.item.id == selected_id:
+            print_selected_recommendation(slot, palette, width, selection_visible)
+        else:
+            print_runway_recommendation(slot, palette, width)
+        print()
+
+
+def visible_live_slots(
+    slots: list[Slot], selected_id: str | None, capacity: int
+) -> list[Slot]:
+    """Fit the runway to the viewport while keeping the selection on screen."""
+    if capacity >= len(slots):
+        return slots
+    selected_index = next(
+        (index for index, slot in enumerate(slots) if slot.item.id == selected_id),
+        0,
+    )
+    start = max(0, min(selected_index - capacity + 1, len(slots) - capacity))
+    return slots[start : start + capacity]
+
+
+def live_slot_capacity(
+    height: int,
+    width: int,
+    repos: list[Repo],
+    github: GithubSnapshot,
+    github_fetched_at: datetime | None,
+    github_is_fresh: bool,
+    has_github_note: bool,
+    idea_header_rows: int = 0,
+    minimum: int = 1,
+) -> int:
+    instrument_rows = len(
+        pack_segments(
+            instrument_segments(repos, github, github_fetched_at, github_is_fresh),
+            width - 4,
+        )
+    )
+    # Header, spacing, instrument label, runway label, and footer. The live
+    # paint drops the frame's final newline, so no spare row is reserved.
+    fixed_rows = 12 + instrument_rows + int(has_github_note) + idea_header_rows
+    return max(minimum, (height - fixed_rows) // 4)
+
+
+def split_live_capacity(capacity: int, runway_count: int, idea_count: int) -> tuple[int, int]:
+    """Give the runway what it needs, the band the remainder, but never zero ideas.
+
+    Without this the band pushes the pane past the viewport and the alternate
+    screen starts scrolling, which is exactly what it exists to prevent.
+    """
+    if idea_count == 0 or capacity <= 1:
+        return capacity, 0
+    ideas = min(idea_count, max(1, capacity - runway_count))
+    return max(1, capacity - ideas), ideas
+
+
+def github_note_shown(github: GithubSnapshot) -> bool:
+    return not github.available and bool(github.error) and github.error != "Skipped with --local"
+
+
+@dataclass
+class PaneLayout:
+    """Which pieces of the live pane fit the terminal right now."""
+
+    notice: bool = False
+    wordmark: bool = True
+    instruments: bool = True
+    runway_header: bool = True
+    runway_capacity: int = 0
+    idea_capacity: int = 0
+    ideas_stamp: bool = False  # the two-row "TERMINAL TOO SHORT" header
+    ideas_empty_band: bool = False  # the "NO IDEAS YET" band, when the runway left room
+    footer: bool = True
+
+
+def pane_layout(
+    repos: list[Repo],
+    github: GithubSnapshot,
+    github_fetched_at: datetime | None,
+    github_is_fresh: bool,
+    runway_count: int,
+    idea_count: int,
+) -> PaneLayout:
+    """Pick the tallest layout that fits, in a fixed fold order.
+
+    Tall panes get everything. When one move no longer fits, the move folds
+    and the runway keeps only its count. Anything smaller is not a dashboard
+    any more: the pane shows the notice. Every layout here is exact, because a
+    frame that scrolls inside the alternate screen is exactly what the pane
+    exists to prevent.
+    """
+    if viewport_below_floor():
+        return PaneLayout(notice=True, wordmark=False, instruments=False, runway_header=False, footer=False)
+    height, width = dashboard_height(), dashboard_width()
+    has_note = github_note_shown(github)
+    capacity = live_slot_capacity(
+        height,
+        width,
+        repos,
+        github,
+        github_fetched_at,
+        github_is_fresh,
+        has_note,
+        idea_header_rows=2 if idea_count else 0,
+        minimum=0,
+    )
+    if capacity >= 1:
+        runway, ideas = split_live_capacity(capacity, runway_count, idea_count)
+        return PaneLayout(
+            runway_capacity=runway,
+            idea_capacity=ideas,
+            ideas_stamp=bool(idea_count) and ideas == 0,
+            ideas_empty_band=idea_count == 0 and runway > runway_count,
+        )
+    instrument_rows = len(pack_segments(instrument_segments(repos, github, github_fetched_at, github_is_fresh), width - 4))
+    needed = (
+        4  # masthead
+        + 1 + 1 + instrument_rows + 1  # blank, WORKSPACE line, its segments, blank
+        + 2  # runway count and its blank
+        + (2 if idea_count else 0)
+        + int(has_note)
+        + 3  # footer
+    )
+    if needed > height:
+        return PaneLayout(notice=True, wordmark=False, instruments=False, runway_header=False, footer=False)
+    return PaneLayout(ideas_stamp=bool(idea_count))
+
+
+def live_layout(
+    repos: list[Repo],
+    github: GithubSnapshot,
+    github_fetched_at: datetime | None,
+    github_is_fresh: bool,
+    runway_count: int,
+    idea_count: int,
+) -> tuple[int, int]:
+    """How many runway slots and idea slots fit the terminal right now.
+
+    Shared by the painter and the key loop, so the arrows can only reach an
+    idea that is actually on screen.
+    """
+    capacity = live_slot_capacity(
+        dashboard_height(),
+        dashboard_width(),
+        repos,
+        github,
+        github_fetched_at,
+        github_is_fresh,
+        github_note_shown(github),
+        idea_header_rows=2 if idea_count else 0,
+        minimum=0,  # a move that does not fit is folded, never forced
+    )
+    return split_live_capacity(capacity, runway_count, idea_count)
+
+
+def print_live_dashboard(
+    root: Path,
+    repos: list[Repo],
+    pipelines: list[Pipeline],
+    github: GithubSnapshot,
+    slots: list[Slot],
+    palette: Palette,
+    github_fetched_at: datetime | None,
+    github_is_fresh: bool,
+    selected_id: str | None = None,
+    selection_visible: bool = True,
+    idea_slots: list[Slot] | None = None,
+    ideas_generated_at: str | None = None,
+) -> None:
+    """Paint the live pane in the layout that fits the terminal right now."""
+    now = datetime.now().astimezone()
+    idea_slots = idea_slots or []
+    layout = pane_layout(repos, github, github_fetched_at, github_is_fresh, len(slots), len(idea_slots))
+    if layout.notice:
+        print_floor_notice(palette)
+        return
+    width = dashboard_width()
+    shown_slots = visible_live_slots(slots, selected_id, layout.runway_capacity)
+    shown_ideas = visible_live_slots(idea_slots, selected_id, layout.idea_capacity)
+    above = io.StringIO()
+    with redirect_stdout(above):
+        if layout.wordmark:
+            print_masthead(palette, width, now, live=True)
+            print()
+        if layout.instruments:
+            print_instrument_band(
+                root,
+                repos,
+                github,
+                palette,
+                width,
+                github_fetched_at,
+                github_is_fresh,
+            )
+            print()
+    print(above.getvalue(), end="")
+    if layout.runway_header:
+        print_runway_header(
+            len(slots), palette, width, stamp="TERMINAL TOO SHORT" if slots and not layout.runway_capacity else None
+        )
+        if layout.runway_capacity or layout.idea_capacity or layout.ideas_stamp or layout.ideas_empty_band or layout.footer:
+            print()  # the header's spacing belongs to what follows it; alone, it ends the frame
+        if layout.runway_capacity:
+            print_live_recommendations(shown_slots, palette, selected_id, selection_visible, width)
+    if idea_slots and layout.idea_capacity:
+        print_ideas_band(
+            shown_ideas, palette, width, ideas_generated_at, selected_id, selection_visible, len(idea_slots)
+        )
+    elif layout.ideas_stamp:
+        # The two reserved rows say the band exists rather than pretending it is
+        # empty; a taller terminal brings it back without a restart.
+        print_ideas_header(len(idea_slots), palette, width, ideas_generated_at, stamp="TERMINAL TOO SHORT")
+        print()
+    elif layout.ideas_empty_band:
+        # An empty band costs one slot's worth of rows; spend them only when
+        # the runway left them over, so a first-time viewer learns the band
+        # exists and how to fill it.
+        print_ideas_band([], palette, width, ideas_generated_at)
+    if layout.instruments and github_note_shown(github):
+        print(f"  {palette.muted('GITHUB NOTE / ' + clip_text(github.error, width - 18))}")
+    if layout.footer:
+        print_instrument_footer(pipelines, palette, width, live=True)
+
+
+def wants_live_pane(args: argparse.Namespace) -> bool:
+    """Bare `pulse` on a TTY stays live; pipes, --json, and --once stay one-shot."""
+    return args.command == "today" and not args.once and not args.json and sys.stdout.isatty()
+
+
+@contextmanager
+def live_input() -> Iterable[int | None]:
+    """Yield a cbreak stdin descriptor, restoring the terminal on every exit."""
+    if not sys.stdin.isatty():
+        yield None
+        return
+    descriptor = sys.stdin.fileno()
+    settings = termios.tcgetattr(descriptor)
+    tty.setcbreak(descriptor)
+    try:
+        yield descriptor
+    finally:
+        termios.tcsetattr(descriptor, termios.TCSADRAIN, settings)
+
+
+def read_live_key(descriptor: int, timeout: float) -> str | None:
+    ready, _writable, _errors = select.select([descriptor], [], [], max(0.0, timeout))
+    if not ready:
+        return None
+    pressed = os.read(descriptor, 1)
+    if pressed == b"\x1b":
+        while select.select([descriptor], [], [], 0.01)[0]:
+            pressed += os.read(descriptor, 1)
+    if pressed in {b"\x1b[A", b"\x1bOA"}:
+        return "up"
+    if pressed in {b"\x1b[B", b"\x1bOB"}:
+        return "down"
+    if pressed in {b"\r", b"\n"}:
+        return "enter"
+    if pressed == b"\x12":
+        return "refresh"
+    return "other"
+
+
+def run_live(args: argparse.Namespace, root: Path, state_path: Path, palette: Palette) -> int:
+    """Paint an interactive dashboard: Git every minute, GitHub every five."""
+    session = LiveSession(args.vibe, args.limit)
+    github: GithubSnapshot | None = None
+    github_at: datetime | None = None
+    selected_id: str | None = None
+    force_github = False
+    # The alternate screen isolates the dashboard from shell scrollback and
+    # restores the exact previous terminal contents when the pane exits.
+    sys.stdout.write(ALT_SCREEN_ENTER + CURSOR_HIDE)
+    try:
+        with live_input() as input_descriptor:
+            while True:
+                tick_started = time.monotonic()
+                now = datetime.now(timezone.utc)
+                repos = inspect_workspace(root)
+                pipelines = inspect_pipelines(root)
+                github_is_fresh = github is None or (
+                    not args.local
+                    and (force_github or (now - github_at).total_seconds() >= GITHUB_REFRESH_SECONDS)
+                )
+                force_github = False
+                if github_is_fresh:
+                    github = fetch_github(args.local)
+                    github_at = now
+
+                dismissals = load_dismissals(state_path)
+                visible = visible_recommendations(all_recommendations(root, repos, github), dismissals)
+                hidden = frozenset(entry["id"] for entry in dismissals)
+                slots = session.refresh(visible, now, hidden)
+                stored_ideas = load_ideas(state_path)
+                idea_slots = session.refresh_ideas(visible_ideas(stored_ideas, dismissals, args.type))
+                # One number space across both bands, so prompt/dismiss/did all
+                # resolve against the same list the user is reading.
+                listed = slots + idea_slots
+                navigable = listed
+                save_listing(
+                    state_path,
+                    args.vibe,
+                    [(slot.number, slot.item) for slot in listed],
+                    live_pid=os.getpid(),
+                )
+
+                def paint(selection_visible: bool = True) -> None:
+                    nonlocal navigable, selected_id
+                    # A band the terminal cannot show is not one the arrows can
+                    # reach; its numbers still resolve from another shell.
+                    runway_capacity, idea_capacity = 0, 0
+                    if slots or idea_slots:
+                        layout = pane_layout(repos, github, github_at, github_is_fresh, len(slots), len(idea_slots))
+                        runway_capacity, idea_capacity = layout.runway_capacity, layout.idea_capacity
+                    navigable = (slots if runway_capacity else []) + (idea_slots if idea_capacity else [])
+                    if navigable:
+                        selected_id = move_live_selection(navigable, selected_id, 0)
+                    screen = io.StringIO()
+                    with redirect_stdout(screen):
+                        print_live_dashboard(
+                            root,
+                            repos,
+                            pipelines,
+                            github,
+                            slots,
+                            palette,
+                            github_at,
+                            github_is_fresh,
+                            selected_id,
+                            selection_visible,
+                            idea_slots,
+                            stored_ideas.get("generated_at"),
+                        )
+                    # Without the final newline the frame may use every row the
+                    # terminal has; with it, a full-height frame scrolls by one.
+                    sys.stdout.write("\033[H\033[2J" + screen.getvalue().rstrip("\n"))
+                    sys.stdout.flush()
+
+                paint()
+                wait = max(1.0, LIVE_REFRESH_SECONDS - (time.monotonic() - tick_started))
+                refresh_at = time.monotonic() + wait
+                terminal_size = shutil.get_terminal_size(fallback=(104, 36))
+                while True:
+                    remaining = refresh_at - time.monotonic()
+                    if input_descriptor is None:
+                        time.sleep(max(0.0, remaining))
+                        key = None
+                    else:
+                        key = read_live_key(
+                            input_descriptor,
+                            min(LIVE_RESIZE_POLL_SECONDS, max(0.0, remaining)),
+                        )
+                    if key is None:
+                        if time.monotonic() >= refresh_at:
+                            break
+                        if input_descriptor is not None:
+                            resized = shutil.get_terminal_size(fallback=(104, 36))
+                            if resized != terminal_size:
+                                terminal_size = resized
+                                paint()
+                        continue
+                    if key == "up" and navigable:
+                        selected_id = move_live_selection(navigable, selected_id, -1)
+                        paint()
+                    elif key == "down" and navigable:
+                        selected_id = move_live_selection(navigable, selected_id, 1)
+                        paint()
+                    elif key == "enter" and selected_id is not None:
+                        selected = next(
+                            (
+                                slot.item
+                                for slot in navigable
+                                if slot.item.id == selected_id and not slot.resolved
+                            ),
+                            None,
+                        )
+                        if selected is not None and copy_agent_prompt(selected, root):
+                            paint(selection_visible=False)
+                            time.sleep(COPY_BLINK_SECONDS)
+                            paint()
+                    elif key == "refresh":
+                        force_github = True
+                        break
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        clear_live_marker(state_path)
+        sys.stdout.write(CURSOR_SHOW + ALT_SCREEN_LEAVE)
+        sys.stdout.flush()
+
+
+AGENTS_MIN_WIDTH = AGENT_GRID_MIN_COLUMNS * AGENT_STRIP_MIN_WIDTH  # 20: two ten-cell cards
+AGENTS_MASTHEAD_ROWS = 5  # title line, the three-row wordmark, and a blank line
+AGENTS_MIN_HEIGHT = AGENT_BAND_ACTIVE_ROWS  # 8: header and one complete card row
+
+
+def agent_grid_rows(lines: int, columns: int, sessions: int) -> tuple[int, bool]:
+    """Choose full rows first; the masthead yields when it would cost a row."""
+    without_masthead = (lines - 1) // AGENT_STRIP_ROWS
+    with_masthead = (lines - AGENTS_MASTHEAD_ROWS - 1) // AGENT_STRIP_ROWS
+    needed_rows = max(1, (sessions + columns - 1) // columns)
+    use_masthead = with_masthead >= 1 and (
+        needed_rows <= with_masthead or with_masthead == without_masthead
+    )
+    return (with_masthead if use_masthead else without_masthead), use_masthead
+
+
+def agents_frame_rows(
+    band: AgentBand,
+    palette: Palette,
+    columns: int,
+    lines: int,
+    frame: int,
+    now: datetime,
+    live: bool = True,
+) -> list[str]:
+    """A two-to-six-column full-card grid, packed into the real terminal."""
+    if columns < AGENTS_MIN_WIDTH or lines < AGENTS_MIN_HEIGHT:
+        notice = f"MAKE THE WINDOW {AGENTS_MIN_WIDTH}x{AGENTS_MIN_HEIGHT} OR LARGER"
+        return [palette.muted(clip_text(notice, max(1, columns)))]
+    width = min(columns, DASHBOARD_MAX_WIDTH)
+    grid_columns = agent_grid_columns(width)
+    framed = width >= 70
+    if not band.active:
+        return agent_band_rows(band, palette, width, frame, now, grid_columns, 1, framed)
+    session_count = len(agent_band_strips(band))
+    grid_rows, use_masthead = agent_grid_rows(lines, grid_columns, session_count)
+    local = now.astimezone()
+    if use_masthead:
+        masthead = io.StringIO()
+        with redirect_stdout(masthead):
+            print_masthead(palette, width, local, live=live, label="AGENTS")
+            print()
+        return masthead.getvalue().split("\n")[:-1] + agent_band_rows(
+            band, palette, width, frame, now, grid_columns, grid_rows, framed
+        )
+    return agent_band_rows(band, palette, width, frame, now, grid_columns, grid_rows, framed)
+
+
+def run_agents(args: argparse.Namespace, root: Path, palette: Palette) -> int:
+    """`pulse agents`: the live agent band on its own, once a second, and nothing else.
+
+    A strip parked in a corner should cost nothing and claim nothing: no
+    repository or GitHub scan, no numbering ownership, no keys beyond Ctrl-C.
+    Every tick rewrites the band's rows in place; only a resize or a change
+    in the band's height clears the screen.
+    """
+    collector = AgentCollector(root=root)
+    band = AgentBand()
+    now = datetime.now(timezone.utc)
+    band.update(collector.scan(now), now)
+    if args.once or not sys.stdout.isatty():
+        size = shutil.get_terminal_size(fallback=(104, 36))
+        for row in agents_frame_rows(band, palette, size.columns, size.lines, 0, now, live=False):
+            print(row)
+        return 0
+    frame = 0
+    painted: tuple[os.terminal_size, int] | None = None
+    sys.stdout.write(ALT_SCREEN_ENTER + CURSOR_HIDE)
+    try:
+        with live_input() as input_descriptor:
+            while True:
+                now = datetime.now(timezone.utc)
+                band.update(collector.scan(now), now)
+                size = shutil.get_terminal_size(fallback=(104, 36))
+                rows = agents_frame_rows(band, palette, size.columns, size.lines, frame, now)
+                geometry = (size, len(rows))
+                if geometry != painted:
+                    sys.stdout.write("\033[H\033[2J" + "\n".join(rows))
+                else:
+                    sys.stdout.write("".join(f"\033[{index};1H\033[2K{row}" for index, row in enumerate(rows, 1)))
+                sys.stdout.flush()
+                painted = geometry
+                frame += 1
+                deadline = time.monotonic() + AGENT_TICK_SECONDS
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    if input_descriptor is None:
+                        time.sleep(remaining)
+                    else:
+                        # Keys mean nothing here; reading them keeps the terminal
+                        # from echoing them over the band. Ctrl-C still interrupts.
+                        read_live_key(input_descriptor, min(LIVE_RESIZE_POLL_SECONDS, remaining))
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        sys.stdout.write(CURSOR_SHOW + ALT_SCREEN_LEAVE)
+        sys.stdout.flush()
+
+
+def print_doctor(root: Path, repos: list[Repo], github: GithubSnapshot, palette: Palette) -> None:
+    print(palette.bold("PROJECT PULSE DOCTOR"))
+    print()
+    checks = [
+        ("Workspace", root.exists(), str(root)),
+        ("Git", shutil.which("git") is not None, shutil.which("git") or "not found"),
+        ("GitHub CLI", shutil.which("gh") is not None, shutil.which("gh") or "not found"),
+        ("GitHub auth", github.available, f"@{github.user}" if github.available else github.error or "unavailable"),
+        ("Repository scan", bool(repos), f"{len(repos)} active repositories"),
+    ]
+    for name, okay, detail in checks:
+        mark = palette.paint("32" if okay else "33", "✓" if okay else "!")
+        print(f"  {mark} {name:<16} {detail}")
+
+
+def json_payload(
+    root: Path,
+    repos: list[Repo],
+    pipelines: list[Pipeline],
+    github: GithubSnapshot,
+    items: list[Recommendation],
+    ideas: list[Recommendation] | None = None,
+) -> str:
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "root": str(root),
+        "repositories": [{**asdict(repo), "changed": repo.changed, "clean": repo.clean} for repo in repos],
+        "pipelines": [asdict(pipeline) for pipeline in pipelines],
+        "github": asdict(github),
+        "recommendations": [{**asdict(item), "id": item.id} for item in items],
+        "ideas": [{**asdict(item), "id": item.id} for item in ideas or []],
+    }
+    return json.dumps(payload, indent=2)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pulse",
+        description="Turn local repository and GitHub state into useful next moves.",
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="today",
+        choices=(
+            "today",
+            "next",
+            "repos",
+            "pipelines",
+            "doctor",
+            "prompt",
+            "dismiss",
+            "dismissed",
+            "restore",
+            "ideas",
+            "did",
+            "agents",
+        ),
+    )
+    parser.add_argument("item", nargs="?", type=int, help="Number shown by prompt, dismiss, did, or restore")
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="workspace to scan (default: $PROJECTS_ROOT, then config `root`, then ~/Projects)",
+    )
+    parser.add_argument("--vibe", choices=VIBES, default="anything", help="Only suggest this kind of work")
+    parser.add_argument("--limit", type=int, default=5, help="Number of next moves to show")
+    parser.add_argument("--local", action="store_true", help="Skip GitHub and use local repository state only")
+    parser.add_argument("--once", action="store_true", help="Print one frame and exit (the live pane is the TTY default)")
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
+    parser.add_argument("--type", choices=IDEA_KINDS, help="Only show ideas of this kind")
+    parser.add_argument("--ideas", type=int, default=IDEA_LIMIT, help="How many ideas the band holds")
+    parser.add_argument(
+        "--refresh", action="store_true", help="ideas: write a new set with the model (costs tokens)"
+    )
+    parser.add_argument("--pack", action="store_true", help="ideas: print the context pack and exit")
+    parser.add_argument("--set", metavar="FILE", help="ideas: read ideas from FILE, or - for stdin")
+    return parser
+
+
+def act_on_item(
+    args: argparse.Namespace, root: Path, state_path: Path, dismissals: list[dict[str, Any]]
+) -> int:
+    """Resolve a number against the list the user was last shown, not a fresh one.
+
+    Re-deriving the list here made the number mean whatever now sits in that slot:
+    a push, a deleted recipe, or the previous handoff agent's own work silently
+    renumbered everything between reading the dashboard and acting on it.
+    """
+    listing, shown_at = load_listing(state_path)
+    if not listing:
+        print("pulse: no recent list to number against; run pulse first", file=sys.stderr)
+        return 2
+    item = next((entry for number, entry in listing if number == args.item), None)
+    if item is None:
+        numbers = ", ".join(str(number) for number, _ in listing)
+        print(
+            f"pulse: item {args.item} is not in the list you were shown (numbers: {numbers})",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.command == "dismiss":
+        dismiss_item(state_path, dismissals, item)
+        print(f"Dismissed: {item.title}")
+        print("Restore it later with: pulse dismissed")
+        return 0
+
+    if args.command == "did":
+        if item.source != "idea":
+            print(
+                f"pulse: {args.item} is a state-based move, not an idea — it clears when its "
+                "condition does, or hide it with: pulse dismiss",
+                file=sys.stderr,
+            )
+            return 2
+        mark_idea_done(state_path, load_ideas(state_path), item)
+        print(f"Retired: {item.title}")
+        print("The next `pulse ideas --refresh` fills the slot it left.")
+        return 0
+
+    if item.source == "idea":
+        # Nothing in a fresh scan can confirm or deny an idea, so there is no
+        # freshness check to run against one.
+        print_agent_prompt(item, root)
+        return 0
+
+    repos = inspect_workspace(root)
+    github = fetch_github(args.local)
+    still_live = {found.id for found in all_recommendations(root, repos, github)}
+    print_agent_prompt(item, root)
+    if item.id not in still_live:
+        when = f" (list shown {shown_at})" if shown_at else ""
+        print(
+            f"pulse: heads up — this recommendation no longer appears in a fresh scan{when}; "
+            "it may already be resolved",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def act_on_ideas(
+    args: argparse.Namespace,
+    root: Path,
+    state_path: Path,
+    dismissals: list[dict[str, Any]],
+    palette: Palette,
+) -> int:
+    """Print the band, or rewrite it — on request only, never on a timer."""
+    model = os.environ.get("PULSE_IDEAS_MODEL", IDEA_MODEL)
+    stored = load_ideas(state_path)
+
+    writing = args.refresh or args.pack or args.set is not None
+    need = free_idea_slots(stored, dismissals, args.ideas)
+    if writing and need == 0:
+        # Nothing to fill: a refresh here would spend tokens, store nothing, and
+        # restamp the band as freshly written.
+        print(f"pulse: {band_full_reason(args.ideas)}", file=sys.stderr)
+        return 1
+
+    if args.pack:
+        print(json.dumps(build_idea_pack(root, inspect_workspace(root), stored, dismissals, need), indent=2))
+        return 0
+
+    if args.set:
+        try:
+            raw = sys.stdin.read() if args.set == "-" else Path(args.set).read_text(encoding="utf-8")
+            incoming = parse_ideas(extract_json(raw))
+        except (OSError, UnicodeDecodeError, IdeaError) as error:
+            print(f"pulse: {error}", file=sys.stderr)
+            print("pulse: existing ideas are unchanged", file=sys.stderr)
+            return 1
+        stored = store_ideas(state_path, stored, dismissals, incoming, args.ideas, "hand-written")
+    elif args.refresh:
+        try:
+            stored = refresh_ideas(
+                state_path, root, inspect_workspace(root), dismissals, model, args.ideas
+            )
+        except IdeaError as error:
+            print(f"pulse: idea refresh failed: {error}", file=sys.stderr)
+            print("pulse: existing ideas are unchanged", file=sys.stderr)
+            return 1
+
+    ideas = visible_ideas(stored, dismissals, args.type)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "generated_at": stored.get("generated_at"),
+                    "model": stored.get("model"),
+                    "ideas": [{**asdict(item), "id": item.id} for item in ideas],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    print_ideas_band(
+        [Slot(number, item) for number, item in enumerate(ideas, 1)],
+        palette,
+        dashboard_width(),
+        stored.get("generated_at"),
+    )
+    if live_pane_owns_numbering(state_path):
+        print(palette.dim("  A live pane is open; prompt/dismiss/did numbers still follow that pane."))
+    elif ideas:
+        # An empty band numbers nothing, so it must not erase the numbering the
+        # user is still reading off the last dashboard.
+        save_listing(state_path, args.vibe, list(enumerate(ideas, 1)))
+    return 0
+
+
+def resolve_root(explicit: Path | None, config: dict[str, Any]) -> Path:
+    """--root beats $PROJECTS_ROOT beats the config file beats ~/Projects."""
+    if explicit is not None:
+        return explicit.expanduser().resolve()
+    environment = os.environ.get("PROJECTS_ROOT")
+    if environment:
+        return Path(environment).expanduser().resolve()
+    configured = configured_root(config)
+    if configured is not None:
+        return configured.resolve()
+    return (Path.home() / "Projects").resolve()
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    config = load_config()
+    root = resolve_root(args.root, config)
+    if not root.is_dir():
+        print(f"pulse: workspace does not exist: {root}", file=sys.stderr)
+        return 2
+    if args.limit < 1:
+        print("pulse: --limit must be at least 1", file=sys.stderr)
+        return 2
+
+    if args.ideas < 1:
+        print("pulse: --ideas must be at least 1", file=sys.stderr)
+        return 2
+    idea_flags = args.refresh or args.pack or args.set is not None
+    if idea_flags and args.command != "ideas":
+        print("pulse: --refresh, --pack, and --set only apply to: pulse ideas", file=sys.stderr)
+        return 2
+    if args.refresh and args.set is not None:
+        print("pulse: choose either --refresh or --set, not both", file=sys.stderr)
+        return 2
+
+    numbered_commands = {"prompt", "dismiss", "did", "restore"}
+    if args.command in numbered_commands and args.item is None:
+        print(f"pulse: {args.command} needs the number of an item", file=sys.stderr)
+        return 2
+    if args.command not in numbered_commands and args.item is not None:
+        print(f"pulse: {args.command} does not accept an item number", file=sys.stderr)
+        return 2
+    if args.item is not None and args.item < 1:
+        print("pulse: item number must be at least 1", file=sys.stderr)
+        return 2
+
+    colors = sys.stdout.isatty() and not args.no_color and "NO_COLOR" not in os.environ
+    palette = Palette(colors)
+    state_path = default_state_path()
+    dismissals = load_dismissals(state_path)
+
+    if args.command == "dismissed":
+        if args.json:
+            print(json.dumps({"state_path": str(state_path), "dismissed": dismissals}, indent=2))
+        else:
+            print_dismissed(dismissals, palette)
+        return 0
+    if args.command == "restore":
+        assert args.item is not None
+        if args.item > len(dismissals):
+            print(f"pulse: dismissed item {args.item} does not exist", file=sys.stderr)
+            return 2
+        restored = dismissals[args.item - 1]
+        save_dismissals(state_path, dismissals[: args.item - 1] + dismissals[args.item :])
+        print(f"Restored: {restored.get('title', restored['id'])}")
+        print("It can appear again whenever its underlying condition still exists.")
+        return 0
+
+    if args.command == "ideas":
+        return act_on_ideas(args, root, state_path, dismissals, palette)
+
+    if args.command == "agents":
+        return run_agents(args, root, palette)
+
+    if args.command in {"prompt", "dismiss", "did"}:
+        assert args.item is not None
+        return act_on_item(args, root, state_path, dismissals)
+
+    if wants_live_pane(args):
+        return run_live(args, root, state_path, palette)
+
+    repos = inspect_workspace(root)
+    pipelines = inspect_pipelines(root)
+    github = fetch_github(args.local or args.command in {"repos", "pipelines"})
+    recommendations = all_recommendations(root, repos, github)
+    visible = visible_recommendations(recommendations, dismissals)
+    selected = select_recommendations(visible, args.vibe, 1 if args.command == "next" else args.limit)
+    stored_ideas = load_ideas(state_path)
+    # `next` is the single-move command: one thing to do now, not a reading list.
+    band = [] if args.command == "next" else visible_ideas(stored_ideas, dismissals, args.type)
+    pane_owns_numbers = False
+    if args.command in {"today", "next"} or args.json:
+        pane_owns_numbers = live_pane_owns_numbering(state_path)
+        if not pane_owns_numbers:
+            entries = list(enumerate(selected, 1))
+            entries += list(enumerate(band, len(selected) + 1))
+            save_listing(state_path, args.vibe, entries)
+
+    if args.json:
+        print(json_payload(root, repos, pipelines, github, selected, band))
+        return 0
+
+    if args.command == "repos":
+        print_repos(repos, palette)
+    elif args.command == "pipelines":
+        print_pipelines(pipelines, palette)
+    elif args.command == "doctor":
+        print_doctor(root, repos, github, palette)
+    elif args.command == "next":
+        print_recommendations(selected, palette)
+    else:
+        print_dashboard(
+            root,
+            repos,
+            pipelines,
+            github,
+            selected,
+            palette,
+            band,
+            stored_ideas.get("generated_at"),
+        )
+    if pane_owns_numbers:
+        print()
+        print(palette.dim("  A live pane is open; prompt/dismiss/did numbers still follow that pane."))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
