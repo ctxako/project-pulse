@@ -1,25 +1,65 @@
 # Project Pulse
 
-Project Pulse turns the current state of a workspace of Git repositories into a
-short list of useful
-next moves. It favors closing open loops, publishing finished work, keeping
-repositories organized, improving terminal tooling, and putting repetitive work
-on autopilot. It does not invent app bugs for you to fix.
+**A terminal instrument that turns a workspace of Git repositories into a short
+list of good next moves.**
+
+Point it at a directory of repositories. It reads their Git state, their GitHub
+state, and the agent pipelines running beside them, then ranks what is worth
+doing right now — an open loop to close, finished work to publish, a project
+that needs an explicit status, a repeated chore worth automating. Every move
+carries the reason it was raised and the command that starts it.
+
+![The Project Pulse live pane](docs/pulse.png)
+
+## Install
+
+One file, no dependencies beyond the Python 3.11+ standard library. Nothing to
+build.
+
+```sh
+git clone https://github.com/ctxako/Project-Pulse-Live.git
+cd Project-Pulse-Live
+./pulse --root ~/your-projects
+```
+
+Put it on your `PATH` and it works from anywhere:
+
+```sh
+ln -s "$PWD/pulse" ~/.local/bin/pulse
+pulse
+```
+
+With no arguments, Pulse scans `~/Projects`. To scan somewhere else, pass
+`--root`, set `$PROJECTS_ROOT`, or write a config file — see
+[Configuration](#configuration).
+
+## What it reads
+
+Pulse never asks you to describe your workspace; it looks. For every repository
+under the root it reads the working tree, the branch and its upstream, the
+commit dates, and the project's shape — language, tests, CI. With the GitHub CLI
+authenticated it adds pull requests that need a decision and pull requests
+waiting on your review. If agents are working in the workspace, it reads their
+own session files to show what they are doing right now.
+
+**Everything it does is read-only.** Pulse suggests commands; it never runs a
+Git write, changes a repository, or edits a GitHub issue or pull request.
+Dismissing a move updates only Pulse's own state file at
+`~/.local/state/project-pulse/state.json`. The one command that reaches off the
+machine is `pulse ideas --refresh`, which calls a model and spends tokens;
+nothing else in Pulse ever does.
+
+## What it suggests
+
+It favors closing open loops, publishing finished work, keeping repositories
+organized, improving terminal tooling, and putting repetitive work on autopilot.
+It does not invent app bugs for you to fix.
 
 Beneath that runway sits a second band, `// WORTH CONSIDERING`: three to five
 model-written ideas — new automations, agents, scripts, technology worth
 adopting — that only change when you ask for them. See below.
 
-The repository and GitHub scan is read-only. Pulse only suggests commands; it
-never runs a Git write, changes a repository, or edits a GitHub issue or pull
-request. Dismissing an idea only updates Project Pulse's own local state at
-`~/.local/state/project-pulse/state.json`. The one command that reaches outside
-the machine is `pulse ideas --refresh`, which calls a model and spends tokens;
-nothing else in pulse ever does.
-
 ## Use it
-
-From this directory:
 
 ```sh
 ./pulse
@@ -205,16 +245,6 @@ then the config file's `root`, then `~/Projects`. A `[[pipeline]]` entry is
 skipped unless its `detect` path exists, so one config can describe several
 machines. A missing or malformed config is not an error — pulse falls back to
 its defaults and keeps running.
-
-## Make `pulse` available everywhere
-
-`~/.local/bin` is already on this machine's `PATH`. Create a symlink once:
-
-```sh
-ln -s "$PWD/pulse" ~/.local/bin/pulse
-```
-
-If a command already exists there, inspect it instead of replacing it.
 
 ## GitHub enrichment
 
