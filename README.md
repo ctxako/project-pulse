@@ -13,12 +13,12 @@ carries the reason it was raised and the command that starts it.
 
 ## Install
 
-One file, no dependencies beyond the Python 3.11+ standard library. Nothing to
-build.
+No third-party Python packages. Requires Python 3.11+ and Git. GitHub CLI and
+Claude Code are optional integrations. Nothing to build.
 
 ```sh
-git clone https://github.com/ctxako/Project-Pulse-Live.git
-cd Project-Pulse-Live
+git clone https://github.com/ctxako/project-pulse.git
+cd project-pulse
 ./pulse --root ~/your-projects
 ```
 
@@ -370,5 +370,6 @@ the same data appears under `pipelines` in `--json` output.
 python3 -m unittest discover -s tests -v
 ```
 
-Pulse is one file with no dependencies beyond the Python 3.11+ standard library
-(`tomllib`). There is nothing to install and nothing to build.
+Pulse is one file with no third-party Python packages. It requires Python 3.11+
+and Git; the GitHub CLI and Claude Code are optional integrations. There is
+nothing to install and nothing to build.
