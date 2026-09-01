@@ -91,31 +91,19 @@ It does not invent app bugs for you to fix.
 
 ## The live pane
 
-Up and down arrows move through the moves and wrap at either end. Enter copies
-the selected move's full agent prompt to the clipboard and flashes its number
-badge. Ctrl-R rescans immediately, GitHub included, without resetting numbering.
-Ctrl-C quits.
+Arrows move through the moves and wrap at either end. Enter copies the selected
+move's full agent prompt to the clipboard. Ctrl-R rescans immediately, GitHub
+included. Ctrl-C quits.
 
 The pane lays out to the real terminal width from 60 columns up (132 at most) so
-nothing wraps, and needs about 20 rows. As the window gets shorter it folds in a
-fixed order rather than scrolling: fewer moves first, then the runway keeps only
-its count. Below the minimum it shows the wordmark and the size it needs, and
-returns the moment you resize.
+nothing wraps, and needs about 20 rows. As the window gets shorter it folds
+rather than scrolling, and returns the moment you resize.
 
-Numbers are never reused within a session. When an item's condition clears, it
-shows a dim check in place for about five minutes and then leaves; new arrivals
-take the next unused number. Ctrl-C and rerun to start at 1 again.
-
-While a pane is open it owns the numbering that `prompt` and `dismiss` resolve
-against, so a `pulse --once` in another terminal renders a fresh snapshot without
-overwriting the pane's numbers, and says so. A pane that dies without cleaning up
-releases its claim after a few minutes.
-
-`pulse prompt 1` turns a displayed recommendation into an agent-ready prompt.
-`prompt` and `dismiss` number against the list you were last shown, which Pulse
-remembers in its state file along with the vibe and limit you used. If the item
-you pick no longer appears in a fresh scan, Pulse still prints the prompt and
-notes on stderr that it may already be resolved.
+Numbers are never reused within a session, and a pane owns the numbering that
+`prompt` and `dismiss` resolve against while it is open. `pulse prompt 1` turns a
+displayed recommendation into an agent-ready prompt; it numbers against the list
+you were last shown, which Pulse remembers along with the vibe and limit you
+used.
 
 Pick the kind of work that sounds good today, or emit JSON for another workflow:
 
@@ -125,9 +113,9 @@ Pick the kind of work that sounds good today, or emit JSON for another workflow:
 ./pulse --json > /tmp/project-pulse.json
 ```
 
-## Worth considering
+## // WORTH CONSIDERING
 
-Everything above the `// WORTH CONSIDERING` line is derived from local state.
+Everything above this line in the pane is derived from local state.
 Nothing in Git can imply "write an agent for this", so the band below it is
 written by a model and holds three to five deliberately ambitious moves: a new
 automation, an agent or pipeline, a script, a technology worth adopting here.
@@ -229,37 +217,16 @@ applies.
 ## Live agents
 
 `pulse agents` shows the interactive Claude Code and Codex sessions running on
-this machine, the counterpart to the unattended pipelines in the dashboard's
-footer. It is a pane of its own, redrawn once a second: it runs no repository or
-GitHub scan, claims no numbering, and answers only Ctrl-C. `pulse agents --once`
-prints a single frame. The dashboard does not carry the band.
+this machine, one equal-size card each, redrawn once a second. It is a pane of
+its own: no repository or GitHub scan, no numbering, Ctrl-C to quit. `pulse
+agents --once` prints a single frame.
 
-Every agent gets the same transparent, equal-size box, and the glyph inside it is
-the status display. It never paints a background, so a translucent terminal stays
-translucent. The grid fits two through six complete cards per row and never
-compacts them; extra sessions fill identical rows when height permits, and only
-sessions beyond the visible rows are reported as `+N QUEUED`.
-
-- **Sources.** Claude sessions come from `claude agents --json`, refreshed every
-  five seconds, with activity read from the matching
-  `~/.claude/projects/<slug>/<session>.jsonl`. An unreadable inventory fails
-  closed for that refresh rather than letting a stale record claim a card. Codex
-  sessions come from `~/.codex/thread-writer-locks/<id>.lock` and the matching
-  rollout under `~/.codex/sessions/`.
-- **What is shown.** Provider, the workspace folder, the session's state, how
-  long it has been in that state, and a one-word activity: a tool name or a file
-  basename. Prompts, tool arguments, tool output, answers, and full paths never
-  reach the screen.
-- **States.** Five: `still`, `thinking`, `editing`, `finishing` (held two minutes
-  after a turn ends), and `waiting`. Waiting is strict: an unanswered
-  `AskUserQuestion` (Claude) or `request_user_input` or escalated approval
-  (Codex), held until the answer lands or the session closes. Silence alone is
-  never waiting.
-- **Positions.** The first six positions are stable and sessions are admitted in
-  start-time order; a first-row position never moves while it is live. A closed
-  session fades for five seconds, then the oldest queued session takes its place.
-  Assignments live in memory only, so restarting rebuilds the order from the
-  providers' start times.
+Claude sessions come from `claude agents --json` and their session trails; Codex
+sessions come from its thread-writer locks and rollouts. Each card shows the
+provider, the workspace folder, one of five states (`still`, `thinking`,
+`editing`, `finishing`, `waiting`), how long it has held that state, and a
+one-word activity. Prompts, tool arguments, tool output, and full paths never
+reach the screen.
 
 ## Agent pipelines
 
@@ -269,37 +236,6 @@ logs, queues, and review records without touching configuration or code.
 Configured workflows with no history show as `READY`; after activity they report
 `IDLE` or `QUEUED` with a run count. `pulse pipelines` adds last-run time and log
 detail, and the same data appears under `pipelines` in `--json`.
-
-## Decisions
-
-A few behaviors look arbitrary until you know what they were weighed against.
-
-**A refresh fills the slots you freed; it never rewrites the band.** The model is
-the expensive, non-deterministic part, and an idea you kept is a judgment you
-already made. Regenerating everything is less code, and it silently discards
-choices and charges you for the privilege.
-
-**The agent band shows a basename, never a path.** It reads live session files
-that hold prompts, tool arguments, and tool output. The more useful band, showing
-the path being edited, turns every screenshot into a disclosure. A test asserts
-it by feeding in a record carrying both a path and a password and checking that
-neither survives.
-
-**Untrusted text is cleaned where it arrives, not where it prints.** Sanitizing
-at each print site means finding every one of them again next time, and still
-leaves raw bytes in the state file and on the clipboard, which is the one that
-matters since Pulse trains you to press Enter and paste.
-
-**A malformed config is not an error.** Failing loudly on bad TOML is correct for
-a build tool and wrong for an instrument you leave open, where a dashboard that
-refuses to start is worse than one that starts knowing less.
-
-**A Codex session is proved live, not assumed live.** A thread-writer lock file
-is empty; its meaning is the kernel advisory lock the running thread holds on it,
-and Codex leaves the file behind when a terminal is closed on it. Pulse takes a
-shared non-blocking `flock` and reads the answer from contention. Any error other
-than contention counts as held, so an odd filesystem shows a session rather than
-hiding one.
 
 ## Development
 
