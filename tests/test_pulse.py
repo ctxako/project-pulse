@@ -1207,9 +1207,15 @@ class IdeaLifecycleTests(unittest.TestCase):
             self.assertEqual(stored["done"], [])
 
     def test_idea_flags_are_refused_outside_the_ideas_command(self):
-        with mock.patch.object(pulse.sys, "stderr", io.StringIO()) as errors:
-            self.assertEqual(pulse.main(["next", "--refresh", "--local"]), 2)
-            self.assertIn("pulse ideas", errors.getvalue())
+        # --root is pinned so the assertion reaches the flag check: without it
+        # main stops at the workspace test, which passes on a machine that
+        # happens to have ~/Projects and fails on one that does not.
+        with tempfile.TemporaryDirectory() as workspace:
+            with mock.patch.object(pulse.sys, "stderr", io.StringIO()) as errors:
+                self.assertEqual(
+                    pulse.main(["next", "--refresh", "--local", "--root", workspace]), 2
+                )
+                self.assertIn("pulse ideas", errors.getvalue())
 
     def test_a_listing_written_before_the_band_existed_still_loads(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2164,10 +2170,13 @@ class AgentsCommandTests(unittest.TestCase):
     def test_agents_once_prints_one_static_band_to_the_normal_screen(self):
         live = [observation("codex", "c", 0, [event("question", 1, "request_user_input", "q")])]
         output = io.StringIO()
-        with mock.patch.object(pulse.AgentCollector, "scan", return_value=live):
-            with mock.patch.object(pulse.shutil, "get_terminal_size", return_value=os.terminal_size((100, 30))):
-                with redirect_stdout(output):
-                    self.assertEqual(pulse.main(["agents", "--once", "--no-color"]), 0)
+        with tempfile.TemporaryDirectory() as workspace:
+            with mock.patch.object(pulse.AgentCollector, "scan", return_value=live):
+                with mock.patch.object(pulse.shutil, "get_terminal_size", return_value=os.terminal_size((100, 30))):
+                    with redirect_stdout(output):
+                        self.assertEqual(
+                            pulse.main(["agents", "--once", "--no-color", "--root", workspace]), 0
+                        )
         rendered = output.getvalue()
         self.assertNotIn(pulse.ALT_SCREEN_ENTER, rendered)
         self.assertEqual(len(rendered.splitlines()), 13)
