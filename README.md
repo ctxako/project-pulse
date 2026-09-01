@@ -3,6 +3,8 @@
 **A terminal instrument that turns a workspace of Git repositories into a short
 list of good next moves.**
 
+[![tests](https://github.com/ctxako/project-pulse/actions/workflows/tests.yml/badge.svg)](https://github.com/ctxako/project-pulse/actions/workflows/tests.yml)
+
 Point it at a directory of repositories. It reads their Git state, their GitHub
 state, and the agent pipelines running beside them, then ranks what is worth
 doing right now — an open loop to close, finished work to publish, a project
@@ -15,6 +17,12 @@ carries the reason it was raised and the command that starts it.
 
 No third-party Python packages. Requires Python 3.11+ and Git. GitHub CLI and
 Claude Code are optional integrations. Nothing to build.
+
+Pulse is a single Python file, deliberately. A tool you clone and run on one
+line has no install step to get wrong and nothing to keep in sync, and that is
+worth more here than tidy module boundaries. The constraint holds while Pulse
+stays one process reading local state; it earns a package the day it needs a
+daemon, a plugin boundary, or a second entry point.
 
 ```sh
 git clone https://github.com/ctxako/project-pulse.git
@@ -46,8 +54,12 @@ own session files to show what they are doing right now.
 Git write, changes a repository, or edits a GitHub issue or pull request.
 Dismissing a move updates only Pulse's own state file at
 `~/.local/state/project-pulse/state.json`. The one command that reaches off the
-machine is `pulse ideas --refresh`, which calls a model and spends tokens;
-nothing else in Pulse ever does.
+machine is `pulse ideas --refresh`, which spends tokens and sends a model the
+shape of your workspace — repository names, the tooling you have, your recent
+`LEDGER.md` entries, and the first lines of each README, private ones included.
+[The pack is described in full below](#worth-considering), and `pulse ideas
+--pack` prints exactly what would be sent without sending it. Nothing else in
+Pulse ever leaves the machine.
 
 ## What it suggests
 
@@ -364,11 +376,65 @@ show as `READY`; after activity they report `IDLE` or `QUEUED` and their run cou
 The detailed `pulse pipelines` command includes last-run time and log detail, and
 the same data appears under `pipelines` in `--json` output.
 
+## Decisions
+
+Pulse is small enough to read end to end, but a few of its behaviors look
+arbitrary until you know what they were weighed against.
+
+**A refresh fills the slots you freed; it never rewrites the band.** The model
+is the expensive, non-deterministic part, and an idea you kept is a judgment you
+already made. Regenerating the whole band on every refresh is less code and the
+obvious shape, and it silently discards choices and charges you for the
+privilege.
+`store_ideas` never touches a kept idea, and `enforce_spread` polices the spread
+across kinds on what a pass *brings in* rather than on the band, so a crowded
+pass ends one idea short instead of costing you one you kept. The spread is
+enforced here rather than asked of the model, because a rule the model is merely
+told about is a rule that holds most of the time.
+
+**The agent band shows a basename, never a path.** It reads live Claude Code and
+Codex session files, which hold prompts, tool arguments, and tool output. The
+more useful band — show the path being edited, or the argument itself — turns
+every screenshot of it into a disclosure. `claude_events`
+reduces a trail record to a tool name and `sanitized_basename` reduces a path to
+a filename; prompts, arguments, output, and answers never reach a structure that
+can be rendered. A test asserts it by feeding in a record carrying both a path
+and a password and checking that neither survives.
+
+**Untrusted text is cleaned where it arrives, not where it prints.** Pull
+request titles are written by other people, log tails and model output by
+neither of us. Sanitizing at each print site means finding every one of them and
+finding them again next time, and still leaves raw bytes in the state file and
+on the clipboard — which is the one that matters, since Pulse trains you to
+press Enter and paste. `safe_text` runs where foreign text enters instead, so
+every sink downstream is clean and Pulse's own styling, which is written here
+and never parsed, cannot pass through it.
+
+**A malformed config is not an error.** `load_config` returns `{}` on any
+failure and Pulse starts on its defaults. Failing loudly on bad TOML is
+conventional, and correct for a build tool; it is wrong for an instrument you
+leave open, where a dashboard that refuses to start is worse than one that
+starts knowing less. The same reasoning puts every `[[pipeline]]` entry behind a
+`detect` path, so one config file can describe several machines and quietly
+report only what is installed here.
+
+**A Codex session is proved live, not assumed live.** A thread-writer lock file
+is empty; its meaning is the kernel advisory lock the running thread holds on
+it. Presence proves nothing — Codex leaves the file behind when a terminal is
+closed on it. `codex_lock_held` takes a shared non-blocking `flock` and reads
+the answer from contention. The earlier version paired presence with a
+ten-minute staleness window, which is the kind of heuristic that works until the
+day it doesn't. Any error other than contention counts as held, so an odd
+filesystem shows a session rather than hiding one.
+
 ## Development
 
 ```sh
 python3 -m unittest discover -s tests -v
 ```
+
+That same command runs in GitHub Actions on every push and pull request, against
+Python 3.11 and 3.13 — the badge at the top of this README is its result.
 
 Pulse is one file with no third-party Python packages. It requires Python 3.11+
 and Git; the GitHub CLI and Claude Code are optional integrations. There is
