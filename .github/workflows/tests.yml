@@ -1,0 +1,36 @@
+# Pulse flags "a project with tests but no GitHub Actions workflow" as a move
+# worth making; this repository was one of them. Every push and pull request
+# now checks out the code on a clean Ubuntu machine and runs the suite, so the
+# README badge reports this repository's real state instead of a claim.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      # Report both legs rather than cancelling the second the moment one fails;
+      # knowing a break is version-specific is the whole point of the matrix.
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor the README promises — it is where tomllib landed, and
+        # the oldest interpreter this is allowed to break on. The newest release
+        # guards the other end.
+        python-version: ['3.11', '3.13']
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      # No install step: pulse is one file with no third-party packages, and the
+      # suite drives real `git init` repositories in temporary directories, which
+      # the runner already provides.
+      - name: Run the test suite
+        run: python3 -m unittest discover -s tests -v
