@@ -170,7 +170,14 @@ def read_state(path: Path) -> dict[str, Any]:
 def write_state(path: Path, state: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps({**state, "version": 1}, indent=2) + "\n")
+    # The state holds model-written prompts and repo names; keep it owner-only.
+    # The mode is set on the temp file, created 0600 rather than chmodded after,
+    # so no moment exists where either file is world-readable. replace() then
+    # carries the mode over — this also tightens a state file from before.
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        os.fchmod(descriptor, 0o600)  # a leftover .tmp keeps its old mode past O_CREAT
+        handle.write(json.dumps({**state, "version": 1}, indent=2) + "\n")
     temporary.replace(path)
 
 
@@ -327,8 +334,39 @@ def run(
 
 
 def git(repo: Path, *args: str) -> str | None:
-    result = run(["git", *args], cwd=repo)
+    # A clone's own .git/config can name commands to run: core.fsmonitor fires
+    # on `git status`, core.pager on any output, hooks on plenty else. Pulse
+    # only reads, so pin all three inert with -c, which outranks every config
+    # file. safe.directory is no defense here — the user owns the clone.
+    result = run(
+        [
+            "git",
+            "-c", "core.fsmonitor=false",
+            "-c", "core.pager=cat",
+            "-c", "core.hooksPath=/dev/null",
+            *args,
+        ],
+        cwd=repo,
+    )
     return result.stdout.strip() if result.returncode == 0 else None
+
+
+def safe_text(value: str) -> str:
+    """Neutralize terminal control bytes in text Pulse did not write itself.
+
+    Applied where untrusted text arrives — gh output, model output, log tails,
+    transcript filenames — rather than at each print, so the state file, the
+    clipboard, and --json carry clean text too. An escape sequence here could
+    rewrite the display or, via OSC 52, the clipboard a user is trained to
+    paste from. The replacement is visible on purpose: a dropped byte would
+    hide that something tried.
+    """
+    return "".join(c if c.isprintable() or c == " " else "�" for c in value)
+
+
+def safe_block(value: str) -> str:
+    """safe_text line by line: idea prompts keep their paragraph breaks."""
+    return "\n".join(safe_text(line) for line in value.splitlines())
 
 
 def relative_name(root: Path, repo: Path) -> str:
@@ -533,7 +571,7 @@ def read_pipeline_log(pipeline: Pipeline, log_path: Path) -> None:
         if lines:
             stamp = lines[-1].split(maxsplit=1)[0]
             pipeline.last_run_at = datetime.fromisoformat(stamp).astimezone().isoformat()
-            pipeline.last_line = lines[-1][:120]
+            pipeline.last_line = safe_text(lines[-1])[:120]
     except (OSError, ValueError):
         pass
 
@@ -572,7 +610,7 @@ def inspect_pipelines(root: Path, config: dict[str, Any] | None = None) -> list[
                     pipeline.last_run_at = finished.isoformat()
                     lines = [line.strip() for line in newest.read_text(errors="replace").splitlines() if line.strip()]
                     if lines:
-                        pipeline.last_line = lines[-1][:120]
+                        pipeline.last_line = safe_text(lines[-1])[:120]
                 queue = directory / "state" / "queue"
                 if queue.is_dir():
                     pipeline.queued = sum(1 for item in queue.iterdir() if not item.name.startswith("."))
@@ -719,7 +757,7 @@ def agent_project_name(cwd: Any, root: Path) -> str:
 def sanitized_basename(value: Any) -> str:
     if not isinstance(value, str) or not value:
         return ""
-    return Path(value).name
+    return safe_text(Path(value).name)
 
 
 def claude_events(record: dict[str, Any], now: datetime) -> list[AgentEvent]:
@@ -1121,7 +1159,9 @@ class AgentLedger:
             self.state = state
             self.state_since = at
         if activity is not None:
-            self.activity = activity
+            # Labels quote the trail: filenames, tool names (an MCP server
+            # picks its own), question kinds. One funnel cleans them all.
+            self.activity = safe_text(activity)
 
     def apply(self, event: AgentEvent) -> None:
         at = event.at
@@ -1278,7 +1318,8 @@ class AgentBand:
 def parse_gh_json(arguments: list[str]) -> tuple[list[dict[str, Any]], str | None]:
     result = run(["gh", *arguments], timeout=15)
     if result.returncode != 0:
-        return [], result.stderr.strip() or "GitHub command failed"
+        # gh's stderr can echo text the server sent; it is shown verbatim.
+        return [], safe_text(result.stderr.strip()) or "GitHub command failed"
     try:
         payload = json.loads(result.stdout or "[]")
         return payload if isinstance(payload, list) else [], None
@@ -1402,12 +1443,15 @@ def github_recommendations(snapshot: GithubSnapshot, now: datetime) -> list[Reco
     if not snapshot.available:
         return []
     recommendations: list[Recommendation] = []
+    # Titles and repository names here are written by whoever opened the PR —
+    # review requests especially are other people's text.
     for pr in snapshot.review_requests or []:
-        repository = (pr.get("repository") or {}).get("nameWithOwner", "GitHub")
+        repository = safe_text(str((pr.get("repository") or {}).get("nameWithOwner", "GitHub")))
+        number = safe_text(str(pr.get("number")))
         recommendations.append(Recommendation(
-            102, "github", f"Review {repository}#{pr.get('number')}",
-            pr.get("title", "A pull request is waiting for you."),
-            f"gh pr view {pr.get('number')} --repo {repository} --web", repository, "github",
+            102, "github", f"Review {repository}#{number}",
+            safe_text(str(pr.get("title", "A pull request is waiting for you."))),
+            f"gh pr view {number} --repo {repository} --web", repository, "github",
         ))
     for pr in snapshot.open_prs or []:
         updated = pr.get("updatedAt")
@@ -1418,12 +1462,13 @@ def github_recommendations(snapshot: GithubSnapshot, now: datetime) -> list[Reco
             except ValueError:
                 pass
         if pr.get("isDraft") or age >= 4:
-            repository = (pr.get("repository") or {}).get("nameWithOwner", "GitHub")
+            repository = safe_text(str((pr.get("repository") or {}).get("nameWithOwner", "GitHub")))
+            number = safe_text(str(pr.get("number")))
             state = "draft" if pr.get("isDraft") else f"quiet for {age} days"
             recommendations.append(Recommendation(
-                86 + min(age, 10), "github", f"Unstick {repository}#{pr.get('number')}",
-                f"This PR is {state}: {pr.get('title', 'untitled')}",
-                f"gh pr view {pr.get('number')} --repo {repository} --web", repository, "github",
+                86 + min(age, 10), "github", f"Unstick {repository}#{number}",
+                f"This PR is {state}: {safe_text(str(pr.get('title', 'untitled')))}",
+                f"gh pr view {number} --repo {repository} --web", repository, "github",
             ))
     return recommendations
 
@@ -1621,7 +1666,9 @@ def build_idea_pack(
     hidden = {entry["id"] for entry in dismissals}
     shelved = [entry for entry in ideas.get("items", []) if idea_recommendation(entry).id in hidden]
     return {
-        "root": str(root),
+        # The folder name only: the full path embeds the username, and the
+        # model needs no more than what the workspace is called.
+        "root": root.name,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "need": need,
         "kinds": list(IDEA_KINDS),
@@ -1717,11 +1764,14 @@ def parse_ideas(payload: Any) -> list[dict[str, str]]:
     for entry in entries:
         if not isinstance(entry, dict):
             raise IdeaError("an idea was not an object")
+        # The model's text is untrusted like any other input: strip control
+        # bytes here, before the ideas reach the state file or a clipboard.
+        # The prompt alone keeps its newlines; it is pasted as written.
         candidate = {
-            "kind": str(entry.get("kind", "")).strip().lower(),
-            "title": str(entry.get("title", "")).strip(),
-            "detail": str(entry.get("detail", "")).strip(),
-            "prompt": str(entry.get("prompt", "")).strip(),
+            "kind": safe_text(str(entry.get("kind", "")).strip().lower()),
+            "title": safe_text(str(entry.get("title", "")).strip()),
+            "detail": safe_text(str(entry.get("detail", "")).strip()),
+            "prompt": safe_block(str(entry.get("prompt", "")).strip()),
         }
         if not valid_idea(candidate):
             raise IdeaError(f"an idea was incomplete or had an unknown kind: {candidate['kind'] or '(none)'}")

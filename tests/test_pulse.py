@@ -2178,5 +2178,106 @@ class AgentsCommandTests(unittest.TestCase):
         self.assertIn("request_use", rendered)  # the tool name, never the question
 
 
+OSC52 = "\x1b]52;c;aGkK\x07"  # writes the clipboard on terminals that honor OSC 52
+
+
+class UntrustedInputHardeningTests(unittest.TestCase):
+    def test_github_titles_and_repo_names_cannot_reach_the_terminal_raw(self):
+        hostile = {
+            "number": 7,
+            "title": f"Fix login {OSC52}\x1b[2J\rquietly",
+            "repository": {"nameWithOwner": f"evil/{OSC52}repo"},
+            "updatedAt": "2026-08-01T00:00:00Z",
+            "isDraft": True,
+        }
+        snapshot = pulse.GithubSnapshot(available=True, user="me", open_prs=[hostile], review_requests=[hostile])
+        items = pulse.github_recommendations(snapshot, datetime.now(timezone.utc))
+        self.assertEqual(len(items), 2)
+        for item in items:
+            for value in (item.title, item.detail, item.command):
+                self.assertNotIn("\x1b", value)
+                self.assertNotIn("\x07", value)
+                self.assertNotIn("\r", value)
+        self.assertIn("Fix login", items[0].detail)  # the readable part survives
+        plain, colored = io.StringIO(), io.StringIO()
+        with redirect_stdout(plain):
+            pulse.print_recommendations(items, pulse.Palette(False))
+        self.assertNotIn("\x1b", plain.getvalue())
+        with redirect_stdout(colored):
+            pulse.print_recommendations(items, pulse.Palette(True))
+        # Pulse's own styling is the only escape left on a colored render.
+        self.assertIn("\x1b[", colored.getvalue())
+        self.assertNotIn("\x1b", ANSI.sub("", colored.getvalue()))
+
+    def test_model_ideas_are_scrubbed_but_prompts_keep_their_paragraphs(self):
+        hostile = {
+            "kind": "script",
+            "title": f"Ship it {OSC52}",
+            "detail": "One\x1b[8m hidden detail",
+            "prompt": f"Line one {OSC52}\n\nLine three",
+        }
+        parsed = pulse.parse_ideas({"ideas": [hostile]})[0]
+        for name in ("title", "detail", "prompt"):
+            self.assertNotIn("\x1b", parsed[name])
+            self.assertNotIn("\x07", parsed[name])
+        self.assertIn("\n\n", parsed["prompt"])  # pasted as written, paragraphs intact
+        self.assertIn("�", parsed["title"])  # the attempt stays visible, not silently dropped
+
+    def test_a_hostile_log_tail_is_neutralized_before_display(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "run.log"
+            log.write_text(f"2026-08-30T10:00:00 ok\n2026-08-31T10:00:00 done {OSC52}\x1b[2J\n")
+            pipeline = pulse.Pipeline(name="orchestrator")
+            pulse.read_pipeline_log(pipeline, log)
+            self.assertNotIn("\x1b", pipeline.last_line)
+            self.assertIn("done", pipeline.last_line)
+
+    def test_transcript_filenames_and_activity_labels_are_scrubbed(self):
+        basename = pulse.sanitized_basename(f"/somewhere/{OSC52}main.py")
+        self.assertNotIn("\x1b", basename)
+        self.assertTrue(basename.endswith("main.py"))
+        ledger = pulse.AgentLedger(at(0))
+        ledger.apply(pulse.AgentEvent(at(1), "activity", f"mcp__{OSC52}__tool"))
+        self.assertNotIn("\x1b", ledger.activity)
+        self.assertIn("tool", ledger.activity)
+
+    def test_state_file_is_owner_only_even_when_it_predates_the_fix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            pulse.write_state(path, {"a": 1})
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            path.chmod(0o644)  # a state file written before the mode was pinned
+            leftover = path.with_suffix(path.suffix + ".tmp")
+            leftover.write_text("{}")
+            leftover.chmod(0o644)  # and a leftover temp file, likewise
+            pulse.write_state(path, {"a": 2})
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(path.read_text())["a"], 2)
+
+    def test_a_repo_config_cannot_run_commands_during_the_scan(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo_path = root / "Hostile"
+            make_repo(repo_path)
+            marker = root / "fsmonitor-ran"
+            command("git", "config", "core.fsmonitor", f"touch '{marker}';", cwd=repo_path)
+            command("git", "status", cwd=repo_path)
+            if not marker.exists():
+                self.skipTest("this git does not execute core.fsmonitor commands")
+            marker.unlink()
+            repo = pulse.inspect_repo(root, repo_path, datetime.now(timezone.utc))
+            self.assertFalse(marker.exists())
+            self.assertEqual(repo.branch, "main")  # the hardened scan still reads real state
+            self.assertTrue(repo.clean)
+
+    def test_idea_pack_names_the_workspace_without_the_absolute_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Workspace"
+            root.mkdir()
+            pack = pulse.build_idea_pack(root, [], {}, [], 3)
+            self.assertEqual(pack["root"], "Workspace")
+            self.assertNotIn(str(root), json.dumps(pack))
+
+
 if __name__ == "__main__":
     unittest.main()
